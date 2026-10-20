@@ -491,10 +491,10 @@ index b56617b..9b12b93 100644
  HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)__executable_start; }
 diff --git a/runtime/ps4/elfload.c b/runtime/ps4/elfload.c
 new file mode 100644
-index 0000000..44d9b6c
+index 0000000..dd2050d
 --- /dev/null
 +++ b/runtime/ps4/elfload.c
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,238 @@
 +/* The NROs' code on the PS4: a library each (tools/ps4/build_ps4.py: dump/nro/<name>.so), loaded when the
 + * game loads the NRO (host.c rt_load_nro), into memory that runs code (memory.c rt_ps4_exec_alloc: direct
 + * memory mapped twice, or flexible memory - whichever this console runs code from).
@@ -507,8 +507,9 @@ index 0000000..44d9b6c
 + * A minimal dynamic loader: the library's segments copied in at one base; its relocations applied - relative
 + * ones, and symbol ones against the eboot's exports (gen/ps4_exports.c: rt_lookup, the C++ runtime, ...)
 + * first and the library's own definitions second, as an executable's symbols win in a dynamic link (the C++
-+ * typeinfo a catch matches by address must be the eboot's, whose code throws); its unwind tables registered
-+ * with the unwinder, one FDE at a time (guest C++ exceptions unwind through NRO code); its initialisers run.
++ * typeinfo a catch matches by address must be the eboot's, whose code throws); its unwind tables found by
++ * the unwinder through its .eh_frame_hdr (guest C++ exceptions unwind through NRO code: "unwind tables"
++ * below); its initialisers run.
 + * Nothing is unloaded. */
 +#include <fcntl.h>
 +#include <stdint.h>
@@ -535,8 +536,6 @@ index 0000000..44d9b6c
 +typedef struct Ps4Export { const char *name; const void *addr; } Ps4Export;
 +extern const Ps4Export ps4_exports[];
 +extern const unsigned ps4_export_count;
-+
-+void __unw_add_dynamic_fde(uintptr_t fde);   /* (libunwind) */
 +
 +static const void *eboot_symbol(const char *name, int *found) {
 +    unsigned a = 0, b = ps4_export_count;
@@ -572,20 +571,63 @@ index 0000000..44d9b6c
 +    return v;
 +}
 +
-+static u32 register_unwind(uint8_t *base, const Phdr *eh, uint64_t span) {
-+    const uint8_t *hdr = base + eh->p_vaddr;
-+    if (hdr[0] != 1) return 0;
-+    const uint8_t *frame = (const uint8_t *)read_encoded(hdr + 4, hdr[1]), *end = base + span;
-+    u32 n = 0;
-+    while (frame && frame + 8 <= end) {
-+        uint64_t len = *(const uint32_t *)frame;
-+        const uint8_t *body = frame + 4;
-+        if (!len) break;
-+        if (len == 0xFFFFFFFFu) { len = *(const uint64_t *)(frame + 4); body = frame + 12; }
-+        if (*(const uint32_t *)body != 0) { __unw_add_dynamic_fde((uintptr_t)frame); n++; }   /* (an FDE: a CIE's id is 0) */
-+        frame = body + len;
++/* ---- unwind tables -----------------------------------------------------------------------------
++ * libunwind (OpenOrbis's, built for bare metal) asks this for the unwind tables of a code address. Its
++ * own answer is the eboot's tables for every address: for a frame of an NRO library's code it searched
++ * the eboot's index, then went through the eboot's whole .eh_frame (7.7 MB) one entry at a time, and
++ * only then looked at the entries registered for the libraries (__unw_add_dynamic_fde: a list it also
++ * goes through one at a time, ~100,000 of them with a match's fighters loaded). Guest C++ exceptions
++ * unwind through the fighters' code all through a match: v00.10's main thread spent 99% of its time
++ * there (1-2 frames a second). Here: the eboot's tables, or the library's own, both found through
++ * their .eh_frame_hdr's sorted table (binary search). (The layout is that libunwind's: dso_base, the
++ * .eh_frame and its length, the .eh_frame_hdr and its length.) */
++typedef struct { uintptr_t dso_base, eh_frame, eh_frame_length, eh_frame_hdr, eh_frame_hdr_length; } UnwindSections;
++extern char __text_start[], __eh_frame_start[], __eh_frame_end[], __eh_frame_hdr_start[], __eh_frame_hdr_end[];
++
++#define MAX_LIBS 128
++static struct { uintptr_t start, end, eh_frame, hdr, hdr_length; } libs[MAX_LIBS];
++static int nlibs;
++
++_Bool ps4_find_unwind_sections(void *self, uintptr_t pc, UnwindSections *info)
++    __asm__("_ZN9libunwind17LocalAddressSpace18findUnwindSectionsEmRNS_18UnwindInfoSectionsE");
++_Bool ps4_find_unwind_sections(void *self, uintptr_t pc, UnwindSections *info) {
++    (void)self;
++    if (pc >= (uintptr_t)__text_start && pc < (uintptr_t)__eh_frame_start) {   /* the eboot (its code and read-only data) */
++        info->dso_base = 0;
++        info->eh_frame = (uintptr_t)__eh_frame_start;
++        info->eh_frame_length = (uintptr_t)(__eh_frame_end - __eh_frame_start);
++        info->eh_frame_hdr = (uintptr_t)__eh_frame_hdr_start;
++        info->eh_frame_hdr_length = (uintptr_t)(__eh_frame_hdr_end - __eh_frame_hdr_start);
++        return 1;
 +    }
-+    return n;
++    int n = __atomic_load_n(&nlibs, __ATOMIC_ACQUIRE);
++    for (int i = 0; i < n; i++)
++        if (pc >= libs[i].start && pc < libs[i].end) {
++            info->dso_base = libs[i].start;
++            info->eh_frame = libs[i].eh_frame;
++            info->eh_frame_length = libs[i].end - libs[i].eh_frame;
++            info->eh_frame_hdr = libs[i].hdr;
++            info->eh_frame_hdr_length = libs[i].hdr_length;
++            return 1;
++        }
++    return 0;   /* (no tables: the unwinder stops there) */
++}
++
++/* A library's tables, for the lookup above; its count of FDEs (the index's), 0 without one. */
++static u32 add_unwind(uint8_t *run, const Phdr *eh, uint64_t span) {
++    const uint8_t *hdr = run + eh->p_vaddr;
++    if (hdr[0] != 1 || hdr[3] != 0x3B) return 0;   /* (version 1, a table of datarel sdata4 pairs) */
++    uintptr_t frame = read_encoded(hdr + 4, hdr[1]);
++    u32 count = (u32)read_encoded(hdr + 8, hdr[2]);
++    if (!frame || nlibs == MAX_LIBS) return 0;
++    int i = nlibs;
++    libs[i].start = (uintptr_t)run;
++    libs[i].end = (uintptr_t)run + span;
++    libs[i].eh_frame = frame;
++    libs[i].hdr = (uintptr_t)hdr;
++    libs[i].hdr_length = eh->p_memsz;
++    __atomic_store_n(&nlibs, i + 1, __ATOMIC_RELEASE);   /* (one loader at a time: nn::ro's) */
++    return count;
 +}
 +
 +const RtModule *rt_ps4_load_nro_code(const RtModule *stub) {
@@ -681,7 +723,7 @@ index 0000000..44d9b6c
 +            int prot = 1 | (ph[i].p_flags & 2 ? 2 : 0) | (ph[i].p_flags & 1 ? 4 : 0);   /* (ELF: PF_X 1, PF_W 2, PF_R 4) */
 +            if (!rt_ps4_exec_protect(&mem, ph[i].p_vaddr, ph[i].p_memsz, prot)) return NULL;
 +        }
-+    u32 fdes = unwind ? register_unwind(run, unwind, span) : 0;
++    u32 fdes = unwind ? add_unwind(run, unwind, span) : 0;
 +    if (init) ((void (*)(void))(void *)(run + init))();
 +    for (uint64_t i = 0; i < init_count; i++) {
 +        void (*fn)(void) = ((void (**)(void))(void *)(run + init_array))[i];
