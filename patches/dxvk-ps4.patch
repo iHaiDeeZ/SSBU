@@ -185,6 +185,55 @@ index a9ed5e7..420fa6a 100644
    pkg.generate(dxgi_dll,
      filebase: dxvk_pkg_prefix + 'dxgi',
      subdirs:  'dxvk',
+diff --git a/src/dxvk/dxvk_pipemanager.cpp b/src/dxvk/dxvk_pipemanager.cpp
+index c1507b4..371a2eb 100644
+--- a/src/dxvk/dxvk_pipemanager.cpp
++++ b/src/dxvk/dxvk_pipemanager.cpp
+@@ -307,6 +307,16 @@ namespace dxvk {
+     key.addShader(shader);
+ 
+     auto library = createShaderPipelineLibrary(key);
++#ifdef DXVK_PS4
++    // PS4 (SSBU port): compiled right here, on the thread that creates the shader - the game's
++    // own shader compiler threads, whose draws wait for the shader. Left to the workers, the
++    // first draw often came before them and compiled it on the rendering thread (the CPU is
++    // slow: a stall of a frame or more for each new shader).
++    if (library) {
++      library->compilePipeline();
++      return;
++    }
++#endif
+     m_workers.compilePipelineLibrary(library, DxvkPipelinePriority::Normal);
+   }
+ 
+diff --git a/src/util/thread.h b/src/util/thread.h
+index ae6f01d..44c8512 100644
+--- a/src/util/thread.h
++++ b/src/util/thread.h
+@@ -15,6 +15,10 @@
+ #include "./rc/util_rc.h"
+ #include "./rc/util_rc_ptr.h"
+ 
++#ifdef DXVK_PS4
++extern "C" int scePthreadSetprio(void* thread, int prio);   // libkernel
++#endif
++
+ namespace dxvk {
+ 
+   /**
+@@ -361,6 +365,12 @@ namespace dxvk {
+     using std::thread::thread;
+ 
+     void set_priority(ThreadPriority priority) {
++#ifdef DXVK_PS4
++      // libkernel's priorities (256 highest .. 767 lowest, 700 the default): the POSIX call
++      // with priority 0 means something else there
++      ::scePthreadSetprio(reinterpret_cast<void*>(this->native_handle()), priority == ThreadPriority::Lowest ? 740 : 700);
++      return;
++#endif
+       ::sched_param param = {};
+       int32_t policy;
+       switch (priority) {
 diff --git a/src/util/util_math.h b/src/util/util_math.h
 index 9276d93..a712940 100644
 --- a/src/util/util_math.h

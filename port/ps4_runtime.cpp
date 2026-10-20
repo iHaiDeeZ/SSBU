@@ -688,6 +688,7 @@ extern "C" void scePthreadGetaffinity();  // libkernel: (ScePthread, SceKernelCp
 extern "C" void ps4_boot_trace(const char* stage);
 extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
 extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
+extern "C" void ps4_profile_thread_begin();        // port/ps4_profile.cpp
 
 extern "C" {
 uint64_t ps4_new_thread_cores = 0x3F;
@@ -716,6 +717,7 @@ void* startOnAppCores(void* raw) {
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
     ps4_watch_thread("(unnamed)");
+    ps4_profile_thread_begin();
     return start.start(start.arg);
 }
 }  // namespace

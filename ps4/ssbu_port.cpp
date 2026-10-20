@@ -8,6 +8,7 @@
 #include "../port/ps4_vk_wsi.h"
 
 extern "C" void ps4_boot_trace(const char* stage);  // port/ps4_crashlog.cpp
+extern "C" void ps4_profile_thread_begin();         // port/ps4_profile.cpp
 
 void ssbu::ps4::wsi_log(const char* line) {
     std::fprintf(stderr, "%s\n", line);
@@ -34,6 +35,13 @@ extern "C" void ps4_port_start() {
     // its pipeline cache kept between runs (the first time each effect is drawn its pipeline is compiled: a hitch)
     mkdir("/data/SSBU/dxvk", 0777);
     setenv("DXVK_SHADER_CACHE_PATH", "/data/SSBU/dxvk", 1);
+    // Pipelines only ever fast-linked from each shader's library: without this DXVK compiles every
+    // pipeline a second time, whole and optimised, on its workers - on this CPU that kept two cores
+    // busy for minutes once a match began. (dxvk.conf's lines come on top.)
+    setenv("DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary = True", 0);
+    // the renderer's details (frame times, draws, uploads, shaders compiling) in the log every 5 s
+    setenv("SSBU_LOG_STATS", "1", 0);
+    ps4_profile_thread_begin();   // (the main thread: the others from their start)
     if (std::FILE* conf = std::fopen("/data/SSBU/dxvk.conf", "r")) {
         std::fclose(conf);
     } else if ((conf = std::fopen("/data/SSBU/dxvk.conf", "w"))) {
