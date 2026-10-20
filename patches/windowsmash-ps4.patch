@@ -631,10 +631,10 @@ index 0000000..9cb7b15
 +#endif
 diff --git a/runtime/ps4/include/ps4_compat.h b/runtime/ps4/include/ps4_compat.h
 new file mode 100644
-index 0000000..d1e2567
+index 0000000..aabe974
 --- /dev/null
 +++ b/runtime/ps4/include/ps4_compat.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,74 @@
 +/* PS4 (the SSBU port): what the Linux platform layer (runtime/linux) takes from Linux and the PS4's
 + * C library (FreeBSD's, by way of OpenOrbis) spells differently or lacks. Included before
 + * everything else in every runtime file (tools/ps4/build_ps4.py: -include). */
@@ -663,8 +663,50 @@ index 0000000..d1e2567
 +unsigned long long rt_ps4_mapped_bytes(void);
 +unsigned long long rt_ps4_failed_maps(void);
 +
++/* Relative paths: the runtime names its files from its working folder (dump/modules/..., save/,
++ * reports/, display.ini) and the PS4 resolves none of them, chdir or not (v00.04: "cannot open
++ * dump/modules/main.reloc.bin" with /data/SSBU the working folder). Each relative path is taken
++ * as /data/SSBU's (runtime/ps4/start.c); absolute ones go as they are. (A few buffers a thread,
++ * in turn: a call may take two paths.) */
++const char *rt_ps4_path(const char *path);
++
 +#ifdef __cplusplus
 +}
++#endif
++
++#ifndef __cplusplus   /* (the C files' calls: the system headers first, then the calls redirected) */
++#include <dirent.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#undef R_OK   /* (access()'s modes: unused here, and kernel.c's result codes have the names) */
++#undef W_OK
++#undef X_OK
++#define fopen(p, m) fopen(rt_ps4_path(p), m)
++#define open(p, ...) open(rt_ps4_path(p), __VA_ARGS__)
++#define stat(p, s) stat(rt_ps4_path(p), s)
++#define mkdir(p, m) mkdir(rt_ps4_path(p), m)
++#define rmdir(p) rmdir(rt_ps4_path(p))
++#define unlink(p) unlink(rt_ps4_path(p))
++#define remove(p) remove(rt_ps4_path(p))
++#define rename(a, b) rename(rt_ps4_path(a), rt_ps4_path(b))
++#define opendir(p) opendir(rt_ps4_path(p))
++
++/* Reads into guest memory (module images, the shared fonts, a socket's data into the guest's buffer): the
++ * kernel cannot fault the lazily mapped pages in, so they are mapped first (runtime/ps4/memory.c; for any
++ * other memory a lookup that finds nothing). */
++#include <sys/socket.h>
++void rt_ww_prepare_write(void *p, size_t n);
++static inline size_t rt_ps4_fread(void *b, size_t s, size_t n, FILE *f) { rt_ww_prepare_write(b, s * n); return fread(b, s, n, f); }
++static inline ssize_t rt_ps4_recv(int fd, void *b, size_t n, int fl) { rt_ww_prepare_write(b, n); return recv(fd, b, n, fl); }
++static inline ssize_t rt_ps4_recvfrom(int fd, void *b, size_t n, int fl, struct sockaddr *a, socklen_t *al) {
++    rt_ww_prepare_write(b, n);
++    return recvfrom(fd, b, n, fl, a, al);
++}
++#define fread(b, s, n, f) rt_ps4_fread(b, s, n, f)
++#define recv(fd, b, n, fl) rt_ps4_recv(fd, b, n, fl)
++#define recvfrom(fd, b, n, fl, a, al) rt_ps4_recvfrom(fd, b, n, fl, a, al)
 +#endif
 +#endif
 diff --git a/runtime/ps4/memory.c b/runtime/ps4/memory.c
@@ -1465,10 +1507,10 @@ index 0000000..d68cd18
 +void hitch_present(void) {}
 diff --git a/runtime/ps4/start.c b/runtime/ps4/start.c
 new file mode 100644
-index 0000000..f73d384
+index 0000000..0f7a3b6
 --- /dev/null
 +++ b/runtime/ps4/start.c
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,43 @@
 +/* The PS4's start (host.c main, as mac_start on macOS): an eboot gets no arguments and starts in
 + * /app0, so the game's tree is /data/SSBU - dump/modules (the module images, romfs.cfg, aoc.cfg),
 + * dump/fonts, save/, reports/, screenshots/, the *.txt and *.ini settings - and the working
@@ -1479,12 +1521,24 @@ index 0000000..f73d384
 +#include <fcntl.h>
 +#include <stdio.h>
 +#include <stdlib.h>
++#include <string.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
 +
 +#define TREE "/data/SSBU"
 +
 +__attribute__((weak)) void ps4_port_start(void);
++
++/* (ps4_compat.h) a relative path as the tree's: the PS4 resolves no relative path */
++const char *rt_ps4_path(const char *path) {
++    static __thread char bufs[4][1024];
++    static __thread unsigned next;
++    if (!path || path[0] == '/') return path;
++    while (path[0] == '.' && path[1] == '/') path += 2;
++    char *buf = bufs[next++ % 4];
++    snprintf(buf, sizeof bufs[0], TREE "/%s", strcmp(path, ".") ? path : "");
++    return buf;
++}
 +
 +void ps4_start(const char **dir, int *options) {
 +    mkdir(TREE, 0777);
