@@ -18,8 +18,10 @@ with SMW's PS4 stack underneath:
 
 ## Milestones
 
-1. **v00.00 graphics proof (no game needed):** DXVK + vkd3d-shader + RADV on the console: a D3D11 test app clears
-   the screen and draws a triangle from an HLSL shader. This is the riskiest bet; prove it first.
+1. **Graphics proof (no game needed): done in v00.02.** DXVK on RADV on the console: a D3D11 test app
+   (tests/dxvk-test) clears the screen and draws a spinning triangle at 59.9 fps with GPU-side VideoOut flips.
+   Lessons: the system modules must be loaded before any call into them (port/ps4_modules.cpp; v00.00/v00.01 died
+   silently in sceVideoOutOpen), and only binary semaphores are dropped from submits (DXVK's timelines work).
 2. **Runtime on PS4:** the Win32 shim on the OpenOrbis libc (futex → address waits, write watch by mprotect on 16 KiB
    pages as on macOS, fibers, files under `/data/SSBU`), the runtime linked with stub modules.
 3. **Game build** (needs the user's SSBU dump: game + update, `prod.keys`/`title.keys`, firmware): upstream's

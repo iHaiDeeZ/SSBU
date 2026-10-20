@@ -1,0 +1,1651 @@
+diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
+index e822de7..e498d1a 100644
+--- a/runtime/hle_pad.c
++++ b/runtime/hle_pad.c
+@@ -539,7 +539,16 @@ static void xinput_raw(const XPad *p, Raw *raw) {
+     raw->axis[RA_RIGHT_TRIGGER] = p->rt * 32767 / 255;
+ }
+ 
++#ifdef __ORBIS__   /* (runtime/ps4/pad.c: DualShock 4s through libScePad, as XInput pads) */
++int ps4_pad_start(void);
++DWORD ps4_pad_get_state(DWORD i, XState *out);
++DWORD ps4_pad_set_state(DWORD i, XVibration *v);
++#endif
++
+ static int xinput_start(void) {
++#ifdef __ORBIS__
++    if (ps4_pad_start()) { xinput_get_state = ps4_pad_get_state; xinput_set_state = ps4_pad_set_state; }
++#endif
+ #ifdef _WIN32
+     HMODULE m = LoadLibraryA("xinput1_4.dll");
+     if (!m) m = LoadLibraryA("xinput9_1_0.dll");
+diff --git a/runtime/host.c b/runtime/host.c
+index ac98629..b4ab695 100644
+--- a/runtime/host.c
++++ b/runtime/host.c
+@@ -459,7 +459,11 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+ }
+ #else
+ /* Another thread's frames: it is interrupted and records its own stack. */
++#ifdef __ORBIS__
++#define SIG_BACKTRACE SIGUSR2
++#else
+ #define SIG_BACKTRACE (SIGRTMIN + 2)
++#endif
+ static void *bt_frames[96];
+ static volatile int bt_count;
+ static sem_t bt_done;
+@@ -483,7 +487,11 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+     clock_gettime(CLOCK_REALTIME, &until);
+     until.tv_nsec += 250000000L;
+     if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
++#ifdef __ORBIS__
++    if (pthread_kill(rt_thread_pthread(thread), SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
++#else
+     if (syscall(SYS_tgkill, getpid(), tid, SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
++#endif
+         static int host_frames = -1;
+         if (host_frames < 0) host_frames = getenv("SSBU_HOST_FRAMES") != NULL;
+         char name[96];
+@@ -513,6 +521,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+     static volatile RtTid reporter;
+     RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
+     (void)si;
++#elif defined(__ORBIS__)
++    /* (FreeBSD's context; a protection fault may come as SIGBUS. Committed guest memory is
++     * mapped on its first touch, and the write watch's writes are noted: runtime/ps4/memory.c) */
++    int writing = (uc->uc_mcontext.mc_err & 2) != 0;
++    if ((sig == SIGSEGV || sig == SIGBUS) && rt_ps4_fault(si->si_addr, writing)) return;
++    u64 addr = (u64)si->si_addr, pc = (u64)uc->uc_mcontext.mc_rip;
++    static volatile pid_t reporter;
++    pid_t me = gettid(), none = 0;
+ #else
+     int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+     if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
+@@ -530,6 +546,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+ #ifdef __APPLE__
+     u64 sp = uc->uc_mcontext->__ss.__sp;
+     int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
++#elif defined(__ORBIS__)
++    u64 sp = (u64)uc->uc_mcontext.mc_rsp;
++    int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
+ #else
+     u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
+     int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
+@@ -1075,6 +1094,10 @@ int main(int argc, char **argv) {
+ #endif
+ #ifdef __APPLE__
+     mac_start(argc, argv, &dir, &options);
++#endif
++#ifdef __ORBIS__
++    void ps4_start(const char **dir, int *options);   /* (runtime/ps4/start.c: /data/SSBU, its log) */
++    ps4_start(&dir, &options);
+ #endif
+     if (!dir) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
+     display_dpi_aware();
+diff --git a/runtime/ipc_audio.c b/runtime/ipc_audio.c
+index e1a7bdf..a3a5fff 100644
+--- a/runtime/ipc_audio.c
++++ b/runtime/ipc_audio.c
+@@ -14,6 +14,14 @@
+ #include <mmsystem.h>   /* after windows.h */
+ #elif defined __APPLE__
+ #include <SDL3/SDL.h>
++#elif defined __ORBIS__
++/* (PS4: sceAudioOut plays what feed hands out, from a thread of ours: open_device) */
++typedef uint8_t Uint8;
++#define SDLCALL
++int32_t sceAudioOutInit(void);
++int32_t sceAudioOutOpen(int32_t user, int32_t type, int32_t index, uint32_t frames, uint32_t rate, uint32_t format);
++int32_t sceAudioOutOutput(int32_t handle, const void *data);
++int32_t sceAudioOutSetVolume(int32_t handle, int32_t channels, int32_t *volume);
+ #else
+ #include <SDL.h>
+ #endif
+@@ -123,6 +131,8 @@ typedef struct Pending { u8 *data; u32 size, pos; u64 tag; int used; } Pending;
+ static struct {
+ #ifdef __APPLE__
+     SDL_AudioStream *out;
++#elif defined __ORBIS__
++    int out;   /* (the sceAudioOut port + 1: 0 when there is none) */
+ #else
+     SDL_AudioDeviceID out;
+ #endif
+@@ -172,6 +182,20 @@ static void SDLCALL pull(void *user, SDL_AudioStream *stream, int wanted, int to
+ }
+ #endif
+ 
++#ifdef __ORBIS__
++#define GRAIN 256   /* frames a call: ~5.3 ms at 48 kHz (the game keeps a few short buffers queued) */
++/* sceAudioOutOutput blocks until the grain before plays: feed's, a grain at a time, for ever. */
++static DWORD WINAPI audio_thread(void *arg) {
++    (void)arg;
++    SetThreadDescription(GetCurrentThread(), L"audio out");
++    static i16 grains[2][GRAIN * CHANNELS];
++    for (int k = 0;; k ^= 1) {
++        feed(NULL, (Uint8 *)grains[k], (int)sizeof grains[k]);
++        sceAudioOutOutput(audio.out - 1, grains[k]);
++    }
++}
++#endif
++
+ static DWORD WINAPI reaper(void *arg) {
+     (void)arg;
+     SetThreadDescription(GetCurrentThread(), L"audio reaper");
+@@ -213,6 +237,17 @@ static void open_device(void) {
+         fprintf(stderr, "[audio] SDL %s output, %d Hz, %d-sample periods\n", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", got.freq, frames);
+         SDL_ResumeAudioStreamDevice(audio.out);
+     }
++#elif defined __ORBIS__
++    int32_t r = sceAudioOutInit();
++    int port = r == 0 || r == (int32_t)0x8026000E ? sceAudioOutOpen(0xFF, 0, 0, GRAIN, RATE, 1) : -1;   /* (the main port; S16 stereo) */
++    if (port < 0) fprintf(stderr, "[audio] no sceAudioOut port (%#x, %#x); sound is dropped\n", (unsigned)r, (unsigned)port);
++    else {
++        int32_t volume[2] = {32768, 32768};   /* (0 dB) */
++        sceAudioOutSetVolume(port, 0x3, volume);
++        audio.out = port + 1;
++        CloseHandle(CreateThread(NULL, 0, audio_thread, NULL, 0, NULL));
++        fprintf(stderr, "[audio] sceAudioOut port %#x, %d Hz, %d-sample periods\n", (unsigned)port, RATE, GRAIN);
++    }
+ #else
+     SDL_AudioSpec want, got;
+     memset(&want, 0, sizeof want);
+diff --git a/runtime/linux/include/windows.h b/runtime/linux/include/windows.h
+index cbd4af5..fffc7d7 100644
+--- a/runtime/linux/include/windows.h
++++ b/runtime/linux/include/windows.h
+@@ -6,6 +6,9 @@
+  * DXVK's windows_base.h, which its Direct3D headers need anyway (DWORD and LONG are 32-bit,
+  * as on Windows). Only what the runtime calls is here.
+  *
++ * The PS4 (the SSBU port) uses it too, as macOS does: memory and the write watch, and waiting on
++ * an address, are runtime/ps4's; ps4_compat.h (runtime/ps4/include) is included before it.
++ *
+  * macOS builds use it too, with the same win32.c; what differs there (memory with 16 KiB pages,
+  * arm64 fibers, Mach thread ids, the profiler) is in runtime/macos/, whose include folder comes
+  * first and has small stand-ins for DXVK's two headers. */
+@@ -138,7 +141,12 @@ static inline void ReleaseSRWLockShared(SRWLOCK *l) { pthread_rwlock_unlock(&l->
+ static inline BOOLEAN TryAcquireSRWLockExclusive(SRWLOCK *l) { return pthread_rwlock_trywrlock(&l->l) == 0; }
+ static inline BOOLEAN TryAcquireSRWLockShared(SRWLOCK *l) { return pthread_rwlock_tryrdlock(&l->l) == 0; }
+ 
++#if defined(__APPLE__) || defined(__ORBIS__)
+ #ifdef __APPLE__
++#define RT_CS_SELF() ((DWORD)pthread_mach_thread_np(pthread_self()))
++#else
++#define RT_CS_SELF() ((DWORD)gettid())   /* (the PS4's mutex is a pointer to the kernel's: its owner is not ours to read) */
++#endif
+ /* Recursive, as on Windows. Darwin's mutex keeps its owner to itself, so the holder's thread id
+  * (GetCurrentThreadId's, 0 when free) is noted here, with the depth of its recursion: read
+  * only, by other threads, for freeze reports. */
+@@ -151,7 +159,7 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs);
+ static inline BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return TRUE; }
+ static inline void EnterCriticalSection(CRITICAL_SECTION *cs) {
+     pthread_mutex_lock(&cs->m);
+-    if (!cs->depth++) cs->OwningThread = (DWORD)pthread_mach_thread_np(pthread_self());
++    if (!cs->depth++) cs->OwningThread = RT_CS_SELF();
+ }
+ static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+     if (!--cs->depth) cs->OwningThread = 0;
+@@ -159,7 +167,7 @@ static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+ }
+ static inline BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
+     if (pthread_mutex_trylock(&cs->m)) return FALSE;
+-    if (!cs->depth++) cs->OwningThread = (DWORD)pthread_mach_thread_np(pthread_self());
++    if (!cs->depth++) cs->OwningThread = RT_CS_SELF();
+     return TRUE;
+ }
+ static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
+diff --git a/runtime/linux/win32.c b/runtime/linux/win32.c
+index b56617b..382ccbf 100644
+--- a/runtime/linux/win32.c
++++ b/runtime/linux/win32.c
+@@ -22,7 +22,7 @@
+ #include <execinfo.h>
+ #include <fcntl.h>
+ #include <fnmatch.h>
+-#ifndef __APPLE__
++#if !defined(__APPLE__) && !defined(__ORBIS__)
+ #include <linux/futex.h>
+ #include <linux/userfaultfd.h>
+ #endif
+@@ -45,6 +45,13 @@
+ 
+ #include <windows.h>
+ 
++/* macOS and the PS4: memory and the write watch (runtime/macos/memory.c, runtime/ps4/memory.c) and
++ * waiting on an address (runtime/macos/platform.c, runtime/ps4/platform.c) are the platform's. */
++#if defined(__APPLE__) || defined(__ORBIS__)
++#define RT_PLATFORM_MEMORY 1
++#define RT_PLATFORM_FUTEX 1
++#endif
++
+ typedef uint8_t u8;
+ typedef uint16_t u16;
+ typedef uint32_t u32;
+@@ -72,7 +79,7 @@ DWORD rt_win32_error(int err) {
+ static BOOL fail_errno(void) { last_error = rt_win32_error(errno); return FALSE; }
+ 
+ /* ---- locks and condition variables ------------------------------------------------------- */
+-#ifndef __APPLE__
++#if !defined(__APPLE__) && !defined(__ORBIS__)
+ _Static_assert(offsetof(CRITICAL_SECTION, OwningThread) == offsetof(pthread_mutex_t, __data.__owner) && sizeof(CRITICAL_SECTION) == sizeof(pthread_mutex_t),
+                "CRITICAL_SECTION's OwningThread is glibc's mutex owner");
+ #endif
+@@ -83,14 +90,15 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs) {
+     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+     pthread_mutex_init(&cs->m, &a);
+     pthread_mutexattr_destroy(&a);
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__ORBIS__)
+     cs->OwningThread = 0;
+     cs->depth = 0;
+ #endif
+ }
+ 
+-#ifdef __APPLE__
+-/* (runtime/macos/platform.c: os_sync_wait_on_address, or __ulock_wait2 before macOS 14.4) */
++#ifdef RT_PLATFORM_FUTEX
++/* (runtime/macos/platform.c: os_sync_wait_on_address, or __ulock_wait2 before macOS 14.4;
++ * runtime/ps4/platform.c: condition variables by address) */
+ int rt_futex_wait(volatile int *addr, int value, DWORD ms);
+ void rt_futex_wake(volatile int *addr, int all);
+ 
+@@ -276,8 +284,16 @@ static u64 monotonic_ns(void) {
+ }
+ 
+ static void sleep_until_ns(u64 t) {
++#ifdef __ORBIS__   /* (relative sleeps, to the time left each time round) */
++    for (u64 now = monotonic_ns(); now < t; now = monotonic_ns()) {
++        u64 ns = t - now;
++        struct timespec ts = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
++        nanosleep(&ts, NULL);
++    }
++#else
+     struct timespec ts = {(time_t)(t / 1000000000ull), (long)(t % 1000000000ull)};
+     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
++#endif
+ }
+ #endif
+ 
+@@ -438,6 +454,12 @@ void rt_thread_signal_stack(void) {
+     if (ss.ss_sp != MAP_FAILED) sigaltstack(&ss, NULL);
+ }
+ 
++#ifdef __ORBIS__
++void *rt_ps4_stack(size_t size, size_t eager);   /* (runtime/ps4/memory.c) */
++int ps4_thread_rename(void *thread, const char *name) __asm__("scePthreadRename");
++void *ps4_thread_self(void) __asm__("scePthreadSelf");
++#endif
++
+ static void *thread_start(void *arg) {
+     Obj *o = arg;
+     o->tid = self_tid();
+@@ -461,7 +483,16 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
+     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+     if (!stack) stack = 8u << 20;
+     stack = (stack + 0xFFFF) & ~(SIZE_T)0xFFFF;
++#ifdef __ORBIS__
++    /* The PS4's thread stacks are flexible memory, a few hundred MiB in all: from the lazy host
++     * range instead (direct memory, mapped as touched; its top 1 MiB at once: system calls with
++     * buffers on the stack cannot fault pages in). The stack stays when the thread ends. */
++    u8 *base = rt_ps4_stack(stack, 1u << 20);
++    if (base) pthread_attr_setstack(&a, base + 0x10000, stack);
++    else pthread_attr_setstacksize(&a, 2u << 20);
++#else
+     pthread_attr_setstacksize(&a, stack);
++#endif
+ #ifdef __APPLE__
+     /* The game's threads (the guest's, the renderer, audio, input) keep pace with frames: on
+      * Apple silicon a thread's class decides between the performance and efficiency cores.
+@@ -549,7 +580,11 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
+     set_description(tid, text);
+     char shortname[16];
+     snprintf(shortname, sizeof shortname, "%s", text);
++#ifdef __ORBIS__   /* (libkernel's: the calling thread only) */
++    if (thread == PSEUDO_THREAD || pthread_equal(rt_thread_pthread(thread), pthread_self())) ps4_thread_rename(ps4_thread_self(), shortname);
++#else
+     pthread_setname_np(thread == PSEUDO_THREAD ? pthread_self() : rt_thread_pthread(thread), shortname);
++#endif
+     return S_OK;
+ }
+ 
+@@ -557,7 +592,11 @@ BOOL SetThreadPriority(HANDLE thread, int priority) {
+     RtTid tid = thread == PSEUDO_THREAD ? self_tid() : rt_thread_tid(thread);
+     if (!tid) return FALSE;
+     int nice = priority <= THREAD_PRIORITY_LOWEST ? 5 : priority == THREAD_PRIORITY_BELOW_NORMAL ? 2 : 0;
++#ifndef __ORBIS__   /* (PS4: the port's thread placement decides; priorities stay as they are) */
+     setpriority(PRIO_PROCESS, (id_t)tid, nice);   /* (raising priority needs privileges: left as it is) */
++#else
++    (void)nice;
++#endif
+     return TRUE;
+ }
+ #endif
+@@ -650,9 +689,14 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
+     (void)flags;
+     size_t size = reserve ? reserve : commit ? commit : (1u << 20);
+     size = (size + 0xFFFF) & ~(size_t)0xFFFF;
++#ifdef __ORBIS__   /* (the lazy host range, its lowest chunk the guard: rt_ps4_stack) */
++    u8 *stack = rt_ps4_stack(size, 64u << 10);
++    if (!stack) { last_error = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
++#else
+     u8 *stack = mmap(NULL, size + 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+     if (stack == MAP_FAILED) { last_error = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+     mprotect(stack, 0x10000, PROT_NONE);   /* a guard below */
++#endif
+     Fiber *f = calloc(1, sizeof *f);
+     f->fn = fn;
+     f->param = param;
+@@ -685,7 +729,11 @@ void SwitchToFiber(LPVOID fiber) {
+ void DeleteFiber(LPVOID fiber) {
+     Fiber *f = fiber;
+     if (!f || f == current_fiber) return;
++#ifdef __ORBIS__
++    if (f->stack) VirtualFree(f->stack, 0, MEM_RELEASE);
++#else
+     if (f->stack) munmap(f->stack, f->stack_size);
++#endif
+     free(f);
+ }
+ BOOL IsThreadAFiber(void) { return current_fiber != NULL; }
+@@ -758,7 +806,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
+ }
+ 
+ /* ---- memory ------------------------------------------------------------------------------- */
+-#ifndef __APPLE__   /* (macOS: runtime/macos/memory.c, with the write watch) */
++#ifndef RT_PLATFORM_MEMORY   /* (macOS: runtime/macos/memory.c, with the write watch; the PS4: runtime/ps4/memory.c) */
+ #define PAGE 4096ull
+ static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
+ typedef struct Reservation { u64 base, size; int watch; } Reservation;
+@@ -899,7 +947,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
+ }
+ 
+ /* ---- the write watch ---------------------------------------------------------------------- */
+-#ifndef __APPLE__
++#ifndef RT_PLATFORM_MEMORY
+ #ifndef UFFD_USER_MODE_ONLY
+ #define UFFD_USER_MODE_ONLY 1
+ #endif
+@@ -1157,8 +1205,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
+     return o;
+ }
+ 
+-#ifdef __APPLE__
+-int rt_ww_storable(const void *p, size_t n);   /* (runtime/macos/memory.c) */
++#ifdef RT_PLATFORM_MEMORY
++int rt_ww_storable(const void *p, size_t n);   /* (runtime/macos/memory.c, runtime/ps4/memory.c) */
+ 
+ /* The read through a host buffer, a megabyte at a time, copied into buf by stores: a store to a
+  * protected page faults, and the fault handler lets it through (rt_ww_fault), however often the
+@@ -1190,7 +1238,7 @@ static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int posit
+  * having filled the pages before (read() moving the file offset on by those) - so the read goes
+  * back to where it started and through a host buffer. */
+ static ssize_t read_some(int fd, void *buf, size_t n, off_t offset, int positional) {
+-#ifdef __APPLE__   /* (macOS: always the protecting watch) */
++#ifdef RT_PLATFORM_MEMORY   /* (macOS and the PS4: always the protecting watch; the PS4's memory is also mapped on first touch) */
+     off_t start = positional ? offset : lseek(fd, 0, SEEK_CUR);
+     ssize_t r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
+     if (r >= 0 || errno != EFAULT) return r;
+@@ -1384,6 +1432,8 @@ errno_t rand_s(unsigned int *value) {
+ #ifdef __APPLE__
+     arc4random_buf(value, sizeof *value);
+     return 0;
++#elif defined(__ORBIS__)   /* (the port's getentropy: sceRandom) */
++    return getentropy(value, sizeof *value) == 0 ? 0 : EIO;
+ #else
+     return getrandom(value, sizeof *value, 0) == (ssize_t)sizeof *value ? 0 : EIO;
+ #endif
+@@ -1397,6 +1447,10 @@ void ExitProcess(UINT code) {
+ #ifdef __APPLE__   /* (the program's Mach-O header: where it is loaded) */
+ HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
+ HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
++#elif defined(__ORBIS__)   /* (the OpenOrbis link.x: the start of the eboot's code) */
++extern char __text_start[];
++HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)__text_start; }
++HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)__text_start; }
+ #else
+ extern char __executable_start[];
+ HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)__executable_start; }
+diff --git a/runtime/ps4/include/execinfo.h b/runtime/ps4/include/execinfo.h
+new file mode 100644
+index 0000000..9cb7b15
+--- /dev/null
++++ b/runtime/ps4/include/execinfo.h
+@@ -0,0 +1,9 @@
++/* PS4: glibc's backtrace, from the unwinder (runtime/ps4/platform.c: _Unwind_Backtrace). */
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++int backtrace(void **frames, int max);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/runtime/ps4/include/ps4_compat.h b/runtime/ps4/include/ps4_compat.h
+new file mode 100644
+index 0000000..d1e2567
+--- /dev/null
++++ b/runtime/ps4/include/ps4_compat.h
+@@ -0,0 +1,32 @@
++/* PS4 (the SSBU port): what the Linux platform layer (runtime/linux) takes from Linux and the PS4's
++ * C library (FreeBSD's, by way of OpenOrbis) spells differently or lacks. Included before
++ * everything else in every runtime file (tools/ps4/build_ps4.py: -include). */
++#pragma once
++#ifdef __ORBIS__
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* A thread's id (Linux: the kernel's, from gettid): libkernel's for the calling thread. */
++int ps4_gettid(void) __asm__("scePthreadGetthreadid");
++static inline pid_t gettid(void) { return (pid_t)ps4_gettid(); }
++
++/* futimens' "leave this time as it is" (FreeBSD's values; the C library's headers lack them) */
++#ifndef UTIME_OMIT
++#define UTIME_NOW (-1L)
++#define UTIME_OMIT (-2L)
++#endif
++
++/* runtime/ps4/memory.c: a fault the guest's memory takes care of (a committed page mapped on its
++ * first touch, a write the protecting write watch notes): 1 when the access can be retried. */
++int rt_ps4_fault(void *address, int writing);
++/* The guest's memory: direct memory mapped so far, chunk mappings that failed (out of memory). */
++unsigned long long rt_ps4_mapped_bytes(void);
++unsigned long long rt_ps4_failed_maps(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/ps4/memory.c b/runtime/ps4/memory.c
+new file mode 100644
+index 0000000..6a9b5cc
+--- /dev/null
++++ b/runtime/ps4/memory.c
+@@ -0,0 +1,506 @@
++/* Memory for the PS4 build of the Windows API (runtime/linux/include/windows.h): VirtualAlloc and
++ * the rest, and the write watch - what runtime/linux/win32.c does on Linux and runtime/macos/
++ * memory.c on macOS, for a system with no demand-zero memory to speak of (the SMW port's design,
++ * its runtime/src/platform_ps4.cpp).
++ *
++ * The PS4's anonymous memory (flexible memory) is small - a few hundred MiB - and committed when
++ * mapped; the game's memory has to be direct memory (physical), of which an app has ~4.5 GiB. The
++ * runtime reserves tens of GiB and commits gigabytes it may never touch (svcSetHeapSize: the whole
++ * heap at once; 512 MiB and 64 MiB thread stacks). So a reservation is address space only
++ * (sceKernelReserveVirtualRange); committing marks its 4 KiB pages usable; the first access to a
++ * committed page faults, and the fault handler (host.c, rt_ps4_fault) maps the 64 KiB chunk
++ * holding it with direct memory, zeroed. Decommitting gives fully decommitted chunks back (to a
++ * free list) and zeroes the decommitted pages of the others. Direct memory is allocated in 32 MiB
++ * blocks (smaller pieces when it is fragmented) and handed out by chunk.
++ *
++ * Reservations with no address of their own (VirtualAlloc(NULL, ...): thread stacks, the
++ * runtime's copies of module code) come from a host range of 16 GiB above the guest's,
++ * [0x7800000000, 0x7C00000000): the guest's own ranges (host.h) end at 0x7781000000.
++ *
++ * The write watch is page protection, as on macOS (16 KiB host pages, 4 KiB guest pages): a
++ * watched area's chunks are mapped read-only; the first write to a host page faults, and the
++ * handler marks every committed 4 KiB page of it written and makes it writable. GetWriteWatch
++ * reports 4 KiB pages; a reset clears them and makes their host pages read-only again. A system
++ * call cannot fault on our behalf (it fails with EFAULT): rt_ww_prepare_write maps and opens the
++ * pages first, and reads go through a host buffer (win32.c read_some) when they fail.
++ *
++ * Everything here runs under one spin lock, which the fault handler takes too: no mutex, no
++ * allocation, nothing that could fault inside it. */
++#include <errno.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++
++#include <windows.h>
++
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef uint64_t u64;
++
++/* libkernel, declared by hand (several OpenOrbis prototypes are wrong or take no parameters) */
++int32_t ps4_reserve_range(void **addr, size_t len, int32_t flags, size_t align) __asm__("sceKernelReserveVirtualRange");
++int32_t ps4_map_direct(void **addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align) __asm__("sceKernelMapDirectMemory");
++int32_t ps4_allocate_direct(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t *phys) __asm__("sceKernelAllocateDirectMemory");
++size_t ps4_direct_memory_size(void) __asm__("sceKernelGetDirectMemorySize");
++int32_t ps4_munmap(void *addr, size_t len) __asm__("sceKernelMunmap");
++int32_t ps4_mprotect(const void *addr, size_t len, int32_t prot) __asm__("sceKernelMprotect");
++
++#define GPAGE 0x1000ull     /* a guest page: what is committed */
++#define HPAGE 0x4000ull     /* a host page: what is protected */
++#define CHUNK 0x10000ull    /* what is mapped */
++#define BLOCK (32ull << 20) /* what is allocated */
++#define MAP_FIXED_PS4 0x10
++#define PROT_R 0x1
++#define PROT_RW 0x3
++#define WB_ONION 0
++
++#define HOST_BASE 0x7800000000ull
++#define HOST_END 0x7C00000000ull
++#define MAX_AREAS 1024
++#define MAX_FREE (1u << 17)   /* freed chunks kept for reuse (8 GiB worth) */
++
++typedef struct Area {
++    u64 base, size;
++    int watch;
++    u8 *committed;   /* a bit a 4 KiB page */
++    u8 *dirty;       /* a bit a 4 KiB page (watched areas) */
++    u32 *phys;       /* a chunk's direct memory, offset / CHUNK + 1 while mapped (0: not mapped) */
++} Area;
++
++static Area areas[MAX_AREAS];   /* sorted by base */
++static int nareas;
++static volatile int lock_word;
++static u64 block_at, block_size, block_used;
++static u32 free_chunks[MAX_FREE];
++static u32 nfree;
++static u64 host_next = HOST_BASE;
++static struct { u64 base, size; } host_free[256];   /* released host ranges, for reuse */
++static int nhost_free;
++static volatile u64 mapped_bytes, failed_maps, faults;
++
++static void lock(void) { while (__atomic_exchange_n(&lock_word, 1, __ATOMIC_ACQUIRE)) sched_yield(); }
++static void unlock(void) { __atomic_store_n(&lock_word, 0, __ATOMIC_RELEASE); }
++
++static int bit(const u8 *map, u64 i) { return map[i >> 3] >> (i & 7) & 1; }
++static void set_bit(u8 *map, u64 i) { map[i >> 3] |= (u8)(1u << (i & 7)); }
++static void clear_bit(u8 *map, u64 i) { map[i >> 3] &= (u8)~(1u << (i & 7)); }
++static u64 round_down(u64 v, u64 to) { return v & ~(to - 1); }
++static u64 round_up(u64 v, u64 to) { return (v + to - 1) & ~(to - 1); }
++
++unsigned long long rt_ps4_mapped_bytes(void) { return mapped_bytes; }
++unsigned long long rt_ps4_failed_maps(void) { return failed_maps; }
++
++/* The area holding [lo, hi), or NULL. (Under the lock.) */
++static Area *area_of(u64 lo, u64 hi) {
++    int a = 0, b = nareas;
++    while (a < b) {
++        int m = (a + b) / 2;
++        if (areas[m].base + areas[m].size <= lo) a = m + 1; else b = m;
++    }
++    if (a < nareas && areas[a].base <= lo && hi <= areas[a].base + areas[a].size) return &areas[a];
++    return NULL;
++}
++
++/* ---- direct memory -------------------------------------------------------------------------- */
++#define NO_PHYS UINT32_MAX
++
++static u32 take_phys(void) {
++    if (nfree) return free_chunks[--nfree];
++    if (block_used == block_size) {
++        off_t phys = 0;
++        u64 size = BLOCK;
++        while (ps4_allocate_direct(0, (off_t)ps4_direct_memory_size(), size, CHUNK, WB_ONION, &phys) != 0)
++            if ((size /= 2) < CHUNK) return NO_PHYS;
++        block_at = (u64)phys;
++        block_size = size;
++        block_used = 0;
++    }
++    u64 at = block_at + block_used;
++    block_used += CHUNK;
++    return (u32)(at / CHUNK);
++}
++
++static void give_phys(u32 phys) {
++    if (nfree < MAX_FREE) free_chunks[nfree++] = phys;
++}
++
++static void reserve_back(u64 addr, u64 size) {
++    void *p = (void *)(uintptr_t)addr;
++    ps4_reserve_range(&p, size, MAP_FIXED_PS4, 0);
++}
++
++/* Maps chunk `ci` of `a` with zeroes: read-only in a watched area, else read-write. (Under the lock.) */
++static int map_chunk(Area *a, u64 ci) {
++    u32 phys = take_phys();
++    if (phys == NO_PHYS) { failed_maps++; return 0; }
++    u64 addr = a->base + ci * CHUNK;
++    ps4_munmap((void *)(uintptr_t)addr, CHUNK);   /* (our reservation there: mapping over it fails) */
++    void *at = (void *)(uintptr_t)addr;
++    if (ps4_map_direct(&at, CHUNK, PROT_RW, MAP_FIXED_PS4, (off_t)phys * (off_t)CHUNK, CHUNK) != 0 || at != (void *)(uintptr_t)addr) {
++        reserve_back(addr, CHUNK);
++        give_phys(phys);
++        failed_maps++;
++        return 0;
++    }
++    memset(at, 0, CHUNK);   /* (direct memory comes with whatever was there before) */
++    if (a->watch) {
++        /* host pages none of whose committed pages are written start read-only */
++        for (u64 h = 0; h < CHUNK; h += HPAGE) {
++            u64 first = (ci * CHUNK + h) / GPAGE, written = 0;
++            for (u64 g = 0; g < HPAGE / GPAGE; g++) written |= (u64)bit(a->dirty, first + g);
++            if (!written) ps4_mprotect((void *)(uintptr_t)(addr + h), HPAGE, PROT_R);
++        }
++    }
++    a->phys[ci] = phys + 1;
++    mapped_bytes += CHUNK;
++    return 1;
++}
++
++static void unmap_chunk(Area *a, u64 ci) {
++    u64 addr = a->base + ci * CHUNK;
++    ps4_munmap((void *)(uintptr_t)addr, CHUNK);
++    reserve_back(addr, CHUNK);
++    give_phys(a->phys[ci] - 1);
++    a->phys[ci] = 0;
++    mapped_bytes -= CHUNK;
++}
++
++/* A write to host page `h` (offset in `a`) of a watched area: its committed pages are written. */
++static void open_page(Area *a, u64 h) {
++    for (u64 g = h / GPAGE; g < (h + HPAGE) / GPAGE; g++)
++        if (bit(a->committed, g)) set_bit(a->dirty, g);
++    ps4_mprotect((void *)(uintptr_t)(a->base + h), HPAGE, PROT_RW);
++}
++
++/* ---- the fault handler's part --------------------------------------------------------------- */
++static __thread u64 last_fault;
++static __thread u32 repeats;
++
++int rt_ps4_fault(void *address, int writing) {
++    u64 addr = (u64)(uintptr_t)address;
++    lock();
++    Area *a = area_of(addr, addr + 1);
++    if (!a || !bit(a->committed, (addr - a->base) / GPAGE)) { unlock(); return 0; }
++    u64 off = addr - a->base, ci = off / CHUNK;
++    int ok = 0;
++    if (!a->phys[ci]) {
++        faults++;
++        ok = map_chunk(a, ci);   /* (a write to a watched one faults again, into the case below) */
++    } else if (a->watch && writing) {
++        open_page(a, round_down(off, HPAGE));
++        ok = 1;
++    } else {
++        /* mapped by another thread between the access and now: retried. The same address faulting
++         * again and again on a mapped page is a real protection fault. */
++        repeats = last_fault == addr ? repeats + 1 : 0;
++        last_fault = addr;
++        ok = repeats < 4;
++    }
++    unlock();
++    return ok;
++}
++
++/* ---- reservations --------------------------------------------------------------------------- */
++static Area *add_area(u64 base, u64 size, int watch) {
++    if (nareas == MAX_AREAS) { fprintf(stderr, "[mem] too many reservations\n"); return NULL; }
++    u64 pages = size / GPAGE, chunks = size / CHUNK;
++    u8 *committed = calloc(1, pages / 8 + 1), *dirty = watch ? calloc(1, pages / 8 + 1) : NULL;
++    u32 *phys = calloc(chunks + 1, sizeof *phys);
++    if (!committed || !phys || (watch && !dirty)) { free(committed); free(dirty); free(phys); return NULL; }
++    int i = nareas;
++    while (i > 0 && areas[i - 1].base > base) { areas[i] = areas[i - 1]; i--; }
++    areas[i] = (Area){base, size, watch, committed, dirty, phys};
++    nareas++;
++    return &areas[i];
++}
++
++/* The host range, reserved whole on first use: what is handed out of it is ours already. */
++static int host_reserved;
++
++static u64 host_range(u64 size) {
++    if (!host_reserved) {
++        void *p = (void *)(uintptr_t)HOST_BASE;
++        host_reserved = ps4_reserve_range(&p, HOST_END - HOST_BASE, MAP_FIXED_PS4, 0) == 0 && p == (void *)(uintptr_t)HOST_BASE ? 1 : -1;
++        if (host_reserved < 0) fprintf(stderr, "[mem] cannot reserve the host range [%#llx, %#llx)\n", HOST_BASE, HOST_END);
++    }
++    if (host_reserved < 0) return 0;
++    for (int i = 0; i < nhost_free; i++)
++        if (host_free[i].size >= size) {
++            u64 at = host_free[i].base;
++            host_free[i].base += size;
++            host_free[i].size -= size;
++            if (!host_free[i].size) host_free[i] = host_free[--nhost_free];
++            return at;
++        }
++    if (host_next + size > HOST_END) return 0;
++    u64 at = host_next;
++    host_next += size;
++    return at;
++}
++
++static void commit_pages(Area *a, u64 lo, u64 hi) {
++    for (u64 g = (lo - a->base) / GPAGE; g < (hi - a->base) / GPAGE; g++) {
++        if (bit(a->committed, g)) continue;
++        set_bit(a->committed, g);
++        if (a->watch) {
++            /* a page newly committed under a host page already writable is reported written: its
++             * writes would go unseen otherwise */
++            u64 ci = g * GPAGE / CHUNK;
++            if (a->phys[ci] && bit(a->dirty, round_down(g * GPAGE, HPAGE) / GPAGE)) set_bit(a->dirty, g);
++            else clear_bit(a->dirty, g);
++        }
++    }
++}
++
++LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
++    (void)protect;   /* (read-write: nothing here asks otherwise of committed memory) */
++    if (!size) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
++    u64 lo = round_down((u64)(uintptr_t)address, GPAGE), hi = round_up((u64)(uintptr_t)address + size, GPAGE);
++    lock();
++    if ((type & MEM_RESERVE) || !address) {
++        u64 bytes = round_up(hi - lo, CHUNK);
++        if (!address) lo = host_range(bytes);
++        else {
++            lo = round_down(lo, CHUNK);
++            bytes = round_up(hi - lo, CHUNK);
++            void *p = (void *)(uintptr_t)lo;
++            if (area_of(lo, lo + 1) || ps4_reserve_range(&p, bytes, MAP_FIXED_PS4, 0) != 0 || p != (void *)(uintptr_t)lo) lo = 0;
++        }
++        Area *a = lo ? add_area(lo, bytes, (type & MEM_WRITE_WATCH) != 0) : NULL;
++        if (!a) { unlock(); SetLastError(ERROR_INVALID_ADDRESS); return NULL; }
++        if (type & MEM_COMMIT) commit_pages(a, lo, lo + round_up(size, GPAGE));
++        unlock();
++        return (void *)(uintptr_t)lo;
++    }
++    Area *a = area_of(lo, hi);
++    if (!a || !(type & MEM_COMMIT)) { unlock(); SetLastError(a ? ERROR_INVALID_PARAMETER : ERROR_INVALID_ADDRESS); return NULL; }
++    commit_pages(a, lo, hi);
++    unlock();
++    return (void *)(uintptr_t)lo;
++}
++
++/* Decommits [lo, hi) of `a`: chunks left with nothing committed go back, the rest have the pages
++ * zeroed (as Windows reads a recommitted page as zeros). (Under the lock.) */
++static void decommit(Area *a, u64 lo, u64 hi) {
++    for (u64 g = (lo - a->base) / GPAGE; g < (hi - a->base) / GPAGE; g++) {
++        clear_bit(a->committed, g);
++        if (a->watch) clear_bit(a->dirty, g);
++    }
++    for (u64 ci = (lo - a->base) / CHUNK; ci * CHUNK < hi - a->base; ci++) {
++        if (!a->phys[ci]) continue;
++        int any = 0;
++        for (u64 g = ci * CHUNK / GPAGE; g < (ci + 1) * CHUNK / GPAGE && !any; g++) any = bit(a->committed, g);
++        if (!any) { unmap_chunk(a, ci); continue; }
++        u64 c = a->base + ci * CHUNK, from = lo > c ? lo : c, to = hi < c + CHUNK ? hi : c + CHUNK;
++        ps4_mprotect((void *)(uintptr_t)c, CHUNK, PROT_RW);
++        memset((void *)(uintptr_t)from, 0, to - from);
++        if (a->watch)   /* (back to read-only where nothing committed is written) */
++            for (u64 h = 0; h < CHUNK; h += HPAGE) {
++                u64 first = (c - a->base + h) / GPAGE, written = 0;
++                for (u64 g = 0; g < HPAGE / GPAGE; g++) written |= (u64)bit(a->dirty, first + g);
++                if (!written) ps4_mprotect((void *)(uintptr_t)(c + h), HPAGE, PROT_R);
++            }
++    }
++}
++
++BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
++    u64 lo = round_down((u64)(uintptr_t)address, GPAGE);
++    lock();
++    if (type & MEM_RELEASE) {
++        for (int i = 0; i < nareas; i++)
++            if (areas[i].base == lo) {
++                Area a = areas[i];
++                for (u64 ci = 0; ci < a.size / CHUNK; ci++) if (a.phys[ci]) unmap_chunk(&a, ci);
++                if (a.base >= HOST_BASE && a.base < HOST_END) {
++                    /* (the host range stays reserved: ours, for reuse) */
++                    if (nhost_free < 256) { host_free[nhost_free].base = a.base; host_free[nhost_free].size = a.size; nhost_free++; }
++                } else ps4_munmap((void *)(uintptr_t)a.base, a.size);
++                free(a.committed);
++                free(a.dirty);
++                free(a.phys);
++                memmove(&areas[i], &areas[i + 1], sizeof *areas * (size_t)(nareas - i - 1));
++                nareas--;
++                unlock();
++                return TRUE;
++            }
++        unlock();
++        SetLastError(ERROR_INVALID_ADDRESS);
++        return FALSE;
++    }
++    if (type & MEM_DECOMMIT) {
++        u64 hi = round_up((u64)(uintptr_t)address + size, GPAGE);
++        Area *a = area_of(lo, hi);
++        if (a) decommit(a, lo, hi);
++        unlock();
++        return a ? TRUE : FALSE;
++    }
++    unlock();
++    SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++}
++
++static int ps4_prot(DWORD protect) {
++    switch (protect & 0xFF) {
++    case PAGE_NOACCESS: return 0;
++    case PAGE_READONLY: case PAGE_EXECUTE: case PAGE_EXECUTE_READ: return PROT_R;
++    default: return PROT_RW;
++    }
++}
++
++BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
++    if (old) *old = PAGE_READWRITE;
++    u64 lo = round_down((u64)(uintptr_t)address, HPAGE), hi = round_up((u64)(uintptr_t)address + size, HPAGE);
++    lock();
++    Area *a = area_of(lo, hi);
++    if (!a) {
++        unlock();
++        return mprotect((void *)(uintptr_t)lo, hi - lo, ps4_prot(protect)) == 0;
++    }
++    for (u64 ci = (lo - a->base) / CHUNK; ci * CHUNK < hi - a->base; ci++)
++        if (!a->phys[ci] && !map_chunk(a, ci)) { unlock(); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
++    ps4_mprotect((void *)(uintptr_t)lo, hi - lo, ps4_prot(protect));
++    unlock();
++    return TRUE;
++}
++
++/* The run of pages from the address with the same state: committed or reserved in an area, or
++ * the free gap up to the next one. */
++SIZE_T VirtualQuery(LPCVOID address, MEMORY_BASIC_INFORMATION *info, SIZE_T length) {
++    if (length < sizeof *info) return 0;
++    u64 at = round_down((u64)(uintptr_t)address, GPAGE);
++    memset(info, 0, sizeof *info);
++    lock();
++    Area *a = area_of(at, at + 1);
++    if (!a) {
++        u64 next = ~0ull;
++        for (int i = 0; i < nareas; i++) if (areas[i].base > at && areas[i].base < next) next = areas[i].base;
++        unlock();
++        if (next == ~0ull) return 0;
++        info->BaseAddress = (void *)(uintptr_t)at;
++        info->RegionSize = next - at;
++        info->State = MEM_FREE;
++        info->Protect = PAGE_NOACCESS;
++        return sizeof *info;
++    }
++    u64 g = (at - a->base) / GPAGE, end = a->size / GPAGE;
++    int state = bit(a->committed, g);
++    u64 e = g + 1;
++    while (e < end) {
++        if (!(e & 7) && e + 8 <= end && a->committed[e >> 3] == (state ? 0xFF : 0)) { e += 8; continue; }
++        if (bit(a->committed, e) != state) break;
++        e++;
++    }
++    info->BaseAddress = (void *)(uintptr_t)at;
++    info->AllocationBase = (void *)(uintptr_t)a->base;
++    info->RegionSize = (e - g) * GPAGE;
++    info->State = state ? MEM_COMMIT : MEM_RESERVE;
++    info->Protect = state ? PAGE_READWRITE : PAGE_NOACCESS;
++    info->Type = MEM_PRIVATE;
++    unlock();
++    return sizeof *info;
++}
++
++/* ---- the write watch ------------------------------------------------------------------------ */
++const char *rt_ww_mode(void) { return "page protection (direct memory mapped on first touch)"; }
++
++int rt_ww_fault(void *address) { return rt_ps4_fault(address, 1); }
++
++/* Before a system call writes [p, p + n): its committed pages mapped, and written (opened) where
++ * watched. */
++void rt_ww_prepare_write(void *p, size_t n) {
++    if (!n) return;
++    u64 lo = (u64)(uintptr_t)p, hi = lo + n;
++    lock();
++    for (u64 at = round_down(lo, GPAGE); at < hi;) {
++        Area *a = area_of(at, at + 1);
++        if (!a) { at += GPAGE; continue; }
++        u64 end = hi < a->base + a->size ? hi : a->base + a->size;
++        for (u64 ci = (at - a->base) / CHUNK; a->base + ci * CHUNK < end; ci++) {
++            u64 c = a->base + ci * CHUNK;
++            int any = 0;
++            for (u64 g = ci * CHUNK / GPAGE; g < (ci + 1) * CHUNK / GPAGE && !any; g++) any = bit(a->committed, g);
++            if (!any || (!a->phys[ci] && !map_chunk(a, ci))) continue;
++            if (a->watch)
++                for (u64 h = c > round_down(at, HPAGE) ? c : round_down(at, HPAGE); h < end && h < c + CHUNK; h += HPAGE)
++                    open_page(a, h - a->base);
++        }
++        at = end;
++    }
++    unlock();
++}
++
++/* Whether stores to all of [p, p + n) can go through (committed memory of ours): else an EFAULT
++ * is real. */
++int rt_ww_storable(const void *p, size_t n) {
++    u64 lo = round_down((u64)(uintptr_t)p, GPAGE), hi = round_up((u64)(uintptr_t)p + n, GPAGE);
++    lock();
++    Area *a = area_of(lo, hi);
++    int ok = a != NULL;
++    for (u64 g = a ? (lo - a->base) / GPAGE : 0; ok && g < (hi - (a ? a->base : 0)) / GPAGE; g++) ok = bit(a->committed, g);
++    unlock();
++    return ok;
++}
++
++UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addresses, ULONG_PTR *count, ULONG *granularity) {
++    u64 lo = round_down((u64)(uintptr_t)base, GPAGE), hi = round_up((u64)(uintptr_t)base + size, GPAGE);
++    if (granularity) *granularity = (ULONG)GPAGE;
++    lock();
++    Area *a = area_of(lo, hi);
++    if (!a || !a->watch || !count) { unlock(); SetLastError(ERROR_INVALID_PARAMETER); return 1; }
++    ULONG_PTR cap = *count, n = 0;
++    u64 first = (lo - a->base) / GPAGE, last = (hi - a->base) / GPAGE, run = ~0ull;
++    for (u64 g = first; g < last && n < cap;) {
++        if (!(g & 7) && g + 8 <= last && !a->dirty[g >> 3]) { g += 8; continue; }
++        if (bit(a->dirty, g)) {
++            addresses[n++] = (void *)(uintptr_t)(a->base + g * GPAGE);
++            if (flags & WRITE_WATCH_FLAG_RESET) {
++                clear_bit(a->dirty, g);
++                u64 h = round_down(g * GPAGE, HPAGE);
++                if (h != run && a->phys[h / CHUNK]) {   /* (each host page made read-only once) */
++                    ps4_mprotect((void *)(uintptr_t)(a->base + h), HPAGE, PROT_R);
++                    run = h;
++                }
++            }
++        }
++        g++;
++    }
++    unlock();
++    *count = n;
++    return 0;
++}
++
++UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
++    u64 lo = round_down((u64)(uintptr_t)base, GPAGE), hi = round_up((u64)(uintptr_t)base + size, GPAGE);
++    lock();
++    Area *a = area_of(lo, hi);
++    if (!a || !a->watch) { unlock(); return 1; }
++    for (u64 h = round_down(lo - a->base, HPAGE); h < hi - a->base; h += HPAGE) {
++        int written = 0;
++        for (u64 g = h / GPAGE; g < (h + HPAGE) / GPAGE; g++) {
++            if (g * GPAGE >= lo - a->base && g * GPAGE < hi - a->base && bit(a->dirty, g)) { clear_bit(a->dirty, g); written = 1; }
++        }
++        if (!written) continue;
++        int still = 0;   /* (pages of the host page outside the range keep it writable) */
++        for (u64 g = h / GPAGE; g < (h + HPAGE) / GPAGE; g++) still |= bit(a->dirty, g);
++        if (!still && a->phys[h / CHUNK]) ps4_mprotect((void *)(uintptr_t)(a->base + h), HPAGE, PROT_R);
++    }
++    unlock();
++    return 0;
++}
++
++/* ---- thread and fiber stacks ---------------------------------------------------------------- */
++/* A stack of `size` from the host range: all committed but its lowest chunk (the guard: an
++ * overflow faults), its top `eager` bytes mapped now (system calls with buffers on the stack
++ * cannot fault them in). The reservation's base, for VirtualFree(MEM_RELEASE); NULL if none. */
++void *rt_ps4_stack(size_t size, size_t eager) {
++    size = (size_t)round_up(size < (1u << 20) ? (1u << 20) : size, CHUNK) + CHUNK;
++    u8 *base = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
++    if (!base) return NULL;
++    VirtualAlloc(base + CHUNK, size - CHUNK, MEM_COMMIT, PAGE_READWRITE);
++    if (eager > size - CHUNK) eager = size - CHUNK;
++    rt_ww_prepare_write(base + size - eager, eager);
++    return base;
++}
+diff --git a/runtime/ps4/pad.c b/runtime/ps4/pad.c
+new file mode 100644
+index 0000000..57428e5
+--- /dev/null
++++ b/runtime/ps4/pad.c
+@@ -0,0 +1,88 @@
++/* The PS4's controllers for hle_pad.c: DualShock 4s through libScePad, behind the XInput backend's
++ * two calls (XInputGetState, XInputSetState). Pad i is the i-th signed-in user's (up to 4);
++ * users who sign in later are found when their pad is next asked for (every half second while
++ * missing, hle_pad.c). The DualShock 4's buttons have XInput's positions - Cross the bottom one,
++ * Circle the right, Square the left, Triangle the top; Options is Start, the touch pad click Back -
++ * and L2/R2 are its analog triggers. */
++#include <stdint.h>
++#include <string.h>
++
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++
++#include <windows.h>
++
++typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XPad;   /* (hle_pad.c's) */
++typedef struct { DWORD packet; XPad pad; } XState;
++typedef struct { WORD left, right; } XVibration;
++
++#define PADS 4
++static struct { int32_t user; int handle; } pads[PADS] = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}};
++static SRWLOCK pads_lock = SRWLOCK_INIT;
++static int started;
++
++int ps4_pad_start(void) {
++    if (started) return started > 0;
++    sceUserServiceInitialize(NULL);
++    started = scePadInit() == 0 ? 1 : -1;
++    return started > 0;
++}
++
++/* The pad of the i-th signed-in user, opened on first use. */
++static int handle_of(DWORD i) {
++    if (i >= PADS) return -1;
++    AcquireSRWLockExclusive(&pads_lock);
++    OrbisUserServiceLoginUserIdList list;
++    memset(&list, 0, sizeof list);
++    int32_t user = -1;
++    if (sceUserServiceGetLoginUserIdList(&list) == 0) {
++        int n = 0;
++        for (int k = 0; k < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; k++)
++            if (list.userId[k] != -1 && n++ == (int)i) { user = list.userId[k]; break; }
++    }
++    if (pads[i].user != user && pads[i].handle >= 0) { scePadClose(pads[i].handle); pads[i].handle = -1; }
++    pads[i].user = user;
++    if (user != -1 && pads[i].handle < 0) pads[i].handle = scePadOpen(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
++    int h = pads[i].handle;
++    ReleaseSRWLockExclusive(&pads_lock);
++    return h;
++}
++
++/* 0..255 (128 the centre) to -32768..32767; `flip` turns it over (XInput's +y is up, the DualShock's down) */
++static SHORT axis(uint8_t v, int flip) {
++    int a = ((int)v - 128) * 258;
++    if (flip) a = -a;
++    return (SHORT)(a < -32768 ? -32768 : a > 32767 ? 32767 : a);
++}
++
++/* 0 with the pad's state, else its absence (ERROR_DEVICE_NOT_CONNECTED). */
++DWORD ps4_pad_get_state(DWORD i, XState *out) {
++    int h = handle_of(i);
++    OrbisPadData d;
++    memset(&d, 0, sizeof d);
++    if (h < 0 || scePadReadState(h, &d) != 0 || !d.connected) return 1167;
++    static const struct { uint32_t ds4; WORD x; } MAP[] = {
++        {ORBIS_PAD_BUTTON_CROSS, 0x1000}, {ORBIS_PAD_BUTTON_CIRCLE, 0x2000}, {ORBIS_PAD_BUTTON_SQUARE, 0x4000},
++        {ORBIS_PAD_BUTTON_TRIANGLE, 0x8000}, {ORBIS_PAD_BUTTON_TOUCH_PAD, 0x0020}, {ORBIS_PAD_BUTTON_OPTIONS, 0x0010},
++        {ORBIS_PAD_BUTTON_L3, 0x0040}, {ORBIS_PAD_BUTTON_R3, 0x0080}, {ORBIS_PAD_BUTTON_L1, 0x0100},
++        {ORBIS_PAD_BUTTON_R1, 0x0200}, {ORBIS_PAD_BUTTON_UP, 0x0001}, {ORBIS_PAD_BUTTON_DOWN, 0x0002},
++        {ORBIS_PAD_BUTTON_LEFT, 0x0004}, {ORBIS_PAD_BUTTON_RIGHT, 0x0008},
++    };
++    memset(out, 0, sizeof *out);
++    out->packet = d.timestamp;
++    for (unsigned k = 0; k < sizeof MAP / sizeof *MAP; k++)
++        if (d.buttons & MAP[k].ds4) out->pad.buttons |= MAP[k].x;
++    out->pad.lt = d.analogButtons.l2;
++    out->pad.rt = d.analogButtons.r2;
++    out->pad.lx = axis(d.leftStick.x, 0);
++    out->pad.ly = axis(d.leftStick.y, 1);
++    out->pad.rx = axis(d.rightStick.x, 0);
++    out->pad.ry = axis(d.rightStick.y, 1);
++    return 0;
++}
++
++DWORD ps4_pad_set_state(DWORD i, XVibration *v) {
++    if (i >= PADS || pads[i].handle < 0) return 1167;
++    OrbisPadVibeParam vibe = {(uint8_t)(v->left >> 8), (uint8_t)(v->right >> 8)};   /* (large motor, small motor) */
++    return scePadSetVibration(pads[i].handle, &vibe) == 0 ? 0 : 1167;
++}
+diff --git a/runtime/ps4/platform.c b/runtime/ps4/platform.c
+new file mode 100644
+index 0000000..95981a3
+--- /dev/null
++++ b/runtime/ps4/platform.c
+@@ -0,0 +1,91 @@
++/* What the PS4 build of the Windows API (runtime/linux/win32.c) needs from the system that Linux
++ * has and the PS4 lacks: waiting on an address (Linux's futex) and walking the stack (glibc's
++ * backtrace).
++ *
++ * Waiting on an address: the PS4's kernel has no futex for applications, so waiters sleep on one
++ * of 256 condition variables picked by the address. A wake wakes every waiter on its variable -
++ * other addresses' too, which then find their value unchanged and wait again (callers loop, as
++ * with a futex's spurious wakeups). The value is checked under the variable's lock, which the
++ * waker takes before it wakes, so a change between the check and the sleep is never missed. */
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <time.h>
++#include <unwind.h>
++
++#include <windows.h>
++
++typedef uint64_t u64;
++
++#define BUCKETS 256
++static struct Bucket {
++    pthread_mutex_t m;
++    pthread_cond_t cv;
++} buckets[BUCKETS];
++
++__attribute__((constructor)) static void futex_init(void) {
++    pthread_condattr_t a;
++    pthread_condattr_init(&a);
++    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
++    for (int i = 0; i < BUCKETS; i++) {
++        pthread_mutex_init(&buckets[i].m, NULL);
++        pthread_cond_init(&buckets[i].cv, &a);
++    }
++    pthread_condattr_destroy(&a);
++}
++
++static struct Bucket *bucket_of(volatile int *addr) {
++    uintptr_t a = (uintptr_t)addr >> 2;
++    return &buckets[(a ^ (a >> 8) ^ (a >> 16)) % BUCKETS];
++}
++
++const char *rt_futex_mode(void) { return "condition variables by address"; }
++
++/* 1 woken (or not holding `value`), 0 timed out */
++int rt_futex_wait(volatile int *addr, int value, DWORD ms) {
++    struct Bucket *b = bucket_of(addr);
++    struct timespec until;
++    if (ms != INFINITE) {
++        clock_gettime(CLOCK_MONOTONIC, &until);
++        until.tv_sec += ms / 1000;
++        until.tv_nsec += (long)(ms % 1000) * 1000000L;
++        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
++    }
++    int woken = 1;
++    pthread_mutex_lock(&b->m);
++    if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) == value) {
++        if (ms == INFINITE) pthread_cond_wait(&b->cv, &b->m);
++        else if (ms == 0 || pthread_cond_timedwait(&b->cv, &b->m, &until) == ETIMEDOUT) woken = 0;
++    }
++    pthread_mutex_unlock(&b->m);
++    return woken;
++}
++
++void rt_futex_wake(volatile int *addr, int all) {
++    (void)all;   /* (every waiter on the variable: see the top of the file) */
++    struct Bucket *b = bucket_of(addr);
++    pthread_mutex_lock(&b->m);
++    pthread_cond_broadcast(&b->cv);
++    pthread_mutex_unlock(&b->m);
++}
++
++/* ---- backtraces --------------------------------------------------------------------------- */
++struct Walk {
++    void **frames;
++    int max, n;
++};
++
++static _Unwind_Reason_Code walk_one(struct _Unwind_Context *ctx, void *arg) {
++    struct Walk *w = arg;
++    if (w->n >= w->max) return _URC_END_OF_STACK;
++    uintptr_t pc = _Unwind_GetIP(ctx);
++    if (!pc) return _URC_END_OF_STACK;
++    w->frames[w->n++] = (void *)pc;
++    return _URC_NO_REASON;
++}
++
++int backtrace(void **frames, int max) {
++    struct Walk w = {frames, max, 0};
++    _Unwind_Backtrace(walk_one, &w);
++    return w.n;
++}
+diff --git a/runtime/ps4/start.c b/runtime/ps4/start.c
+new file mode 100644
+index 0000000..f73d384
+--- /dev/null
++++ b/runtime/ps4/start.c
+@@ -0,0 +1,31 @@
++/* The PS4's start (host.c main, as mac_start on macOS): an eboot gets no arguments and starts in
++ * /app0, so the game's tree is /data/SSBU - dump/modules (the module images, romfs.cfg, aoc.cfg),
++ * dump/fonts, save/, reports/, screenshots/, the *.txt and *.ini settings - and the working
++ * folder is that tree, as the port's root is on the other systems. stdout and stderr go to
++ * /data/SSBU/ssbu.log (a new one each start; the last one kept as ssbu.old.log). The port's own
++ * start (ps4_port_start: the screen opened before any graphics, DXVK's settings) runs first, if
++ * it links one in. */
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#define TREE "/data/SSBU"
++
++__attribute__((weak)) void ps4_port_start(void);
++
++void ps4_start(const char **dir, int *options) {
++    mkdir(TREE, 0777);
++    rename(TREE "/ssbu.log", TREE "/ssbu.old.log");
++    int fd = open(TREE "/ssbu.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
++    setvbuf(stderr, NULL, _IONBF, 0);
++    if (chdir(TREE)) fprintf(stderr, "[boot] cannot work in %s\n", TREE);
++    mkdir(TREE "/save", 0777);
++    mkdir(TREE "/reports", 0777);
++    mkdir(TREE "/screenshots", 0777);
++    if (ps4_port_start) ps4_port_start();
++    *dir = "dump/modules";
++    *options = 1;
++}
+diff --git a/runtime/ps4/window.c b/runtime/ps4/window.c
+new file mode 100644
+index 0000000..b241467
+--- /dev/null
++++ b/runtime/ps4/window.c
+@@ -0,0 +1,33 @@
++/* The game's "window" on the PS4: the TV, 1920 x 1080 at 60 Hz, through VideoOut. DXVK presents
++ * there with its PS4 window system (the port's DXVK, patches/dxvk-ps4.patch: any HWND is the
++ * screen; the swapchain is the port's port/ps4_vk_wsi.cpp). There is no keyboard; the pads are
++ * hle_pad.c's (its PS4 backend). The main thread has no events to run: it waits, and prints the
++ * status when asked to. */
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <windows.h>
++
++#include "../display.h"
++
++#define SCREEN ((void *)(uintptr_t)1)   /* (the HWND every swap chain is made for) */
++
++SHORT GetAsyncKeyState(int vk) { (void)vk; return 0; }
++HWND GetForegroundWindow(void) { return (HWND)SCREEN; }
++void *rt_window(void) { return SCREEN; }
++
++int rt_window_init(void) {
++    setenv("DXVK_WSI_DRIVER", "PS4", 1);
++    display_note_size(1920, 1080);
++    display_note_refresh(60);
++    fprintf(stderr, "[gfx] the screen: 1920x1080 at 60 Hz (VideoOut)\n");
++    return 1;
++}
++
++/* Runs on the main thread for good. `status` is called every `every` seconds (0: never). */
++void rt_window_loop(int every, void (*status)(void)) {
++    for (;;) {
++        Sleep(every > 0 ? (DWORD)every * 1000 : 1000);
++        if (every > 0 && status) status();
++    }
++}
+diff --git a/tools/ps4/build_codecs_ps4.py b/tools/ps4/build_codecs_ps4.py
+new file mode 100644
+index 0000000..45e2fa5
+--- /dev/null
++++ b/tools/ps4/build_codecs_ps4.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""The codecs for the PS4 - libopus (the game's music) and libvpx's VP9 decoder (its movies) - from third_party/, as
++tools/codec_libs.py builds them for macOS (build_static): <out>/codecs/libopus.a and libvpx.a, with the PS4
++toolchain's flags (tools/ps4/build_ps4.py). opus in portable C (Windows' x86 build presumes AVX2, which the PS4's
++Jaguar lacks); libvpx with its x86-64 configuration, in plain C as everywhere.
++
++Usage: build_codecs_ps4.py [--out <dir>] [--force]"""
++import os
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++sys.path.insert(0, os.path.dirname(HERE))
++import build_ps4  # noqa: E402
++import codec_libs as cl  # noqa: E402
++
++
++def main():
++    out = os.path.abspath(build_ps4.arg("--out", os.path.join(build_ps4.HOME, "ssbu-build", "build")))
++    codecs = os.path.join(out, "codecs")
++    os.makedirs(codecs, exist_ok=True)
++    libs = {
++        "opus": (os.path.join(codecs, "libopus.a"), cl.OPUS, cl.OPUS_FOLDERS_ARM64, cl.OPUS_INCLUDES, cl.OPUS_DEFINES_ARM64, cl.have_opus),
++        "libvpx": (os.path.join(codecs, "libvpx.a"), cl.VPX, cl.VPX_FOLDERS, cl.VPX_INCLUDES, (), cl.have_vpx),
++    }
++    for name, (lib, root, folders, includes, defines, have) in libs.items():
++        if not have():
++            print(f"{name}: no sources in {root}")
++            continue
++        flags = cl.static_flags(build_ps4.CFLAGS, root, includes, defines)
++        if "--force" in sys.argv or not os.path.isfile(lib) or not cl.is_current(lib, root, folders, includes):
++            cl.build_static_lib(name, lib, root, folders, flags, build_ps4.CLANG, "llvm-ar-21", build_ps4.JOBS, print)
++        print(f"{name}: {lib}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/ps4/build_ps4.py b/tools/ps4/build_ps4.py
+new file mode 100644
+index 0000000..b8aceb8
+--- /dev/null
++++ b/tools/ps4/build_ps4.py
+@@ -0,0 +1,271 @@
++#!/usr/bin/env python3
++"""Build the game's objects for the PS4 (the SSBU port: github.com/iHaiDeeZ, E:\\PS4 Projects\\SSBU).
++
++Usage: build_ps4.py [--port <dir>] [--out <dir>] [--jobs N] [--runtime-only]
++
++As tools/linux/build_linux.py, but with the PS4 toolchain (clang 21, the OpenOrbis C library, the port's libc++
++sysroot) and for the PS4's processor (AMD Jaguar: -march=btver2, AVX but no AVX2 or FMA). The recompiled game is the
++C tools/recomp.py all --generate-only wrote into <port>/build/{main,subsdk0,sdk,nro/*}; the runtime is runtime/*.c
++with the Linux platform layer (runtime/linux, its Win32 shim) and the PS4's (runtime/ps4). Nothing is linked here:
++<out>/objects.rsp lists every object for the eboot's link (the port's ps4/CMakeLists.txt, with DXVK, RADV and the
++PS4 layer). Incremental: a file is compiled again when its source is newer than its object.
++
++Environment: OPENORBIS (/opt/pacbrew/ps4/openorbis), PS4_SYSROOT (~/ssbu-build/sysroot), CLANG_VER (21),
++DXVK_SRC (~/ssbu-build/src/dxvk: the DirectX headers), VKD3D_SRC (the vkd3d source, for its headers)."""
++import os
++import re
++import subprocess
++import sys
++import time
++from concurrent.futures import ThreadPoolExecutor, as_completed
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++REPO = os.path.dirname(os.path.dirname(HERE))
++RUNTIME = os.path.join(REPO, "runtime")
++sys.path.insert(0, os.path.join(REPO, "tools"))
++import progress  # noqa: E402
++
++
++def arg(name, default=None):
++    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
++
++
++HOME = os.path.expanduser("~")
++OO = os.environ.get("OPENORBIS", "/opt/pacbrew/ps4/openorbis")
++SYSROOT = os.environ.get("PS4_SYSROOT", os.path.join(HOME, "ssbu-build", "sysroot"))
++CLANG = "clang-" + os.environ.get("CLANG_VER", "21")
++DXVK_SRC = os.environ.get("DXVK_SRC", os.path.join(HOME, "ssbu-build", "src", "dxvk"))
++VKD3D_SRC = os.environ.get("VKD3D_SRC", "")
++PORT = os.path.abspath(arg("--port", REPO))
++OUT = os.path.abspath(arg("--out", os.path.join(HOME, "ssbu-build", "build", "ssbu")))
++JOBS = int(arg("--jobs", str(max(4, (os.cpu_count() or 8) - 4))))
++GEN = os.path.join(OUT, "gen")
++
++# Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math (as on Windows and Linux).
++CFLAGS = ["--target=x86_64-pc-freebsd12-elf", "-D_GNU_SOURCE", "-D__PS4__", "-D__ORBIS__", "-D__OPENORBIS__", "-DPS4",
++          "-D__BSD_VISIBLE", "-D_BSD_SOURCE", "-fPIE", "-funwind-tables", "-fasynchronous-unwind-tables",
++          "-march=btver2", "--sysroot=" + OO, "-isystem", os.path.join(SYSROOT, "libc-overlay"),
++          "-isystem", os.path.join(OO, "include"), "-isystem", os.path.join(SYSROOT, "include"),
++          "-fno-strict-aliasing", "-ffp-contract=off", "-w", "-I", RUNTIME]
++CXXFLAGS = ["-x", "c++", "-std=gnu++20", "-fexceptions", "-nostdinc++", "-isystem",
++            os.path.join(SYSROOT, "include", "c++", "v1")]
++RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "ps4", "include"), "-I", os.path.join(RUNTIME, "linux", "include"),
++                    "-I", os.path.join(DXVK_SRC, "include", "native", "windows"),
++                    "-I", os.path.join(DXVK_SRC, "include", "native", "directx"),
++                    "-I", os.path.join(DXVK_SRC, "include", "vulkan", "include"), "-I", GEN]
++if VKD3D_SRC:
++    RUNTIME_INCLUDES += ["-I", os.path.join(VKD3D_SRC, "include")]
++RUNTIME_DEFINES = ["-D_REENTRANT", "-DSSBU_PS4", "-include", os.path.join(RUNTIME, "ps4", "include", "ps4_compat.h")]
++# The codecs (tools/ps4/build_codecs_ps4.py: libopus, libvpx's VP9 decoder from third_party/), linked into the eboot
++if os.path.isfile(os.path.join(REPO, "third_party", "opus", "src", "opus_decoder.c")):
++    RUNTIME_DEFINES += ["-DSSBU_HAVE_OPUS"]
++if os.path.isfile(os.path.join(REPO, "third_party", "libvpx", "vp9", "vp9_dx_iface.c")):
++    RUNTIME_DEFINES += ["-DSSBU_HAVE_VPX", "-I", os.path.join(REPO, "third_party", "libvpx")]
++# Linux layer files the PS4 does not build: the window (SDL), the profiler (perf events), UPnP
++LINUX_SKIP = {"window.c", "profile.c", "upnp.c"}
++
++
++def run(cmd):
++    r = subprocess.run(["nice", "-n", "10", *cmd], capture_output=True, text=True)
++    return r.returncode, r.stdout + r.stderr
++
++
++def compile_one(job):
++    src, obj, opt = job[:3]
++    flags = list(job[3]) if len(job) > 3 else []
++    os.makedirs(os.path.dirname(obj), exist_ok=True)
++    cxx = src.endswith((".cpp", ".cc")) or "c++" in flags
++    flags = [f for f in flags if f != "c++"]
++    code, out = run([CLANG, "-c", opt, *CFLAGS, *(CXXFLAGS if cxx else []), *flags, src, "-o", obj])
++    return (src, out) if code else None
++
++
++def needs(obj, *srcs):
++    return not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(s) for s in srcs)
++
++
++def modules():
++    build = os.path.join(PORT, "build")
++    found = [(n, os.path.join(build, n), os.path.join(OUT, n)) for n in ("main", "subsdk0", "sdk")]
++    nro = os.path.join(build, "nro")
++    if os.path.isdir(nro):
++        found += [(n, os.path.join(nro, n), os.path.join(OUT, "nro", n)) for n in sorted(os.listdir(nro))
++                  if os.path.exists(os.path.join(nro, n, "manifest.tsv"))]
++    return [m for m in found if os.path.exists(os.path.join(m[1], "manifest.tsv"))]
++
++
++def has_landing_sites(path):
++    with open(path, "rb") as f:
++        return b"__try" in f.read()
++
++
++def game_jobs():
++    recomp_h = os.path.join(RUNTIME, "recomp.h")
++    jobs = []
++    for _name, src_dir, out_dir in modules():
++        with open(os.path.join(src_dir, "manifest.tsv")) as f:
++            rows = [line.split("\t") for line in f.read().splitlines() if line]
++        for fname, _insns, biggest in rows + [["g_module.c", "0", "0"]]:
++            src = os.path.join(src_dir, fname)
++            obj = os.path.join(out_dir, fname[:-2] + ".o")
++            opt = "-O1" if int(biggest) > 20000 or fname == "g_module.c" else "-O2"
++            if not needs(obj, src, recomp_h):
++                continue
++            if fname != "g_module.c" and has_landing_sites(src):
++                # (as on Linux: guest try/catch as C++; the giant lua2cpp tables at -O0)
++                if int(biggest) > 50000:
++                    opt = "-O0"
++                wrapper = os.path.join(out_dir, fname[:-2] + "_cxx.cpp")
++                os.makedirs(out_dir, exist_ok=True)
++                text = '#include "recomp.h"\nextern "C" {\n#include "%s"\n}\n' % src
++                if not os.path.exists(wrapper) or open(wrapper).read() != text:
++                    with open(wrapper, "w") as f:
++                        f.write(text)
++                jobs.append((wrapper, obj, opt))
++            else:
++                jobs.append((src, obj, opt))
++    return jobs
++
++
++def hle_names():
++    names = set()
++    for n in os.listdir(RUNTIME):
++        if n.endswith(".c"):
++            with open(os.path.join(RUNTIME, n), encoding="utf-8") as f:
++                names |= set(re.findall(r"^HLE\((\w+)\)", f.read(), re.M))
++    return sorted(names)
++
++
++def hle_wraps():
++    found = set()
++    for n in os.listdir(RUNTIME):
++        if n.endswith(".c"):
++            with open(os.path.join(RUNTIME, n), encoding="utf-8") as f:
++                found |= {int(a, 16) for a in re.findall(r"^HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M)}
++    return sorted(found)
++
++
++def write_if_changed(path, text):
++    if os.path.exists(path) and open(path, encoding="utf-8").read() == text:
++        return False
++    with open(path, "w", encoding="utf-8", newline="\n") as f:
++        f.write(text)
++    return True
++
++
++def overlay_font():
++    """gen/overlay_font.h, drawn as on Linux (tools/linux/make_overlay_font.py, Pillow and a monospace font)."""
++    os.makedirs(GEN, exist_ok=True)
++    header = os.path.join(GEN, "overlay_font.h")
++    tool = os.path.join(REPO, "tools", "linux", "make_overlay_font.py")
++    if not needs(header, tool):
++        return
++    r = subprocess.run(["python3", tool, header], capture_output=True, text=True)
++    if r.returncode:
++        print("could not draw the overlay font: the overlay shows no text\n" + (r.stdout + r.stderr).strip())
++        with open(header, "w", newline="\n") as f:
++            f.write("static const unsigned char overlay_font[%d] = {0};\n" % (24 * 16 * 48 * 6))
++
++
++def runtime_sources():
++    sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
++               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
++    sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
++                if n.endswith((".c", ".cpp")) and n not in LINUX_SKIP and not (n == "d3dcompile_vkd3d.c" and not VKD3D_SRC)]
++    sources += [os.path.join(RUNTIME, "ps4", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "ps4")))
++                if n.endswith((".c", ".cpp"))]
++    return sources
++
++
++def runtime_jobs():
++    os.makedirs(GEN, exist_ok=True)
++    rt_out = os.path.join(OUT, "rt")
++    headers = [os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")]
++    for d in ("linux/include", "ps4/include", "ps4"):
++        p = os.path.join(RUNTIME, d)
++        if os.path.isdir(p):
++            headers += [os.path.join(p, n) for n in os.listdir(p) if n.endswith(".h")]
++    flags = RUNTIME_INCLUDES + RUNTIME_DEFINES
++    jobs = []
++    for src in runtime_sources():
++        obj = os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o")
++        if needs(obj, src, *headers):
++            jobs.append((src, obj, "-O2", flags))
++    names = hle_names()
++    table = os.path.join(GEN, "hle_table.c")
++    changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
++                               + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
++                               + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
++    if changed or needs(os.path.join(rt_out, "hle_table.o"), table, *headers):
++        jobs.append((table, os.path.join(rt_out, "hle_table.o"), "-O1", flags))
++    missing = os.path.join(GEN, "wrap_missing.c")
++    changed = write_if_changed(missing, '#include "host.h"\n\nvoid rt_wrap_missing(Cpu *c);\n'
++                               + "".join(f"__attribute__((weak)) void f_{a:x}_orig(Cpu *c) {{ rt_wrap_missing(c); }}\n"
++                                         for a in hle_wraps()))
++    if changed or needs(os.path.join(rt_out, "wrap_missing.o"), missing, *headers):
++        jobs.append((missing, os.path.join(rt_out, "wrap_missing.o"), "-O1", flags))
++    nros = [n for n, src, _o in modules() if os.path.basename(os.path.dirname(src)) == "nro"]
++    nro_table = os.path.join(GEN, "nro_table.c")
++    changed = write_if_changed(nro_table, '#include "module.h"\n\n' + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
++                               + "const RtModule *const rt_nro_modules[] = {" + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
++                               + f"const u32 rt_nro_count = {len(nros)};\n")
++    if changed or needs(os.path.join(rt_out, "nro_table.o"), nro_table):
++        jobs.append((nro_table, os.path.join(rt_out, "nro_table.o"), "-O1", ["-I", RUNTIME]))
++    return jobs
++
++
++def in_order(jobs):
++    def source_size(job):
++        src = job[0]
++        if src.endswith("_cxx.cpp"):
++            src = re.findall(r'#include "([^"]+)"', open(src).read())[-1]
++        return os.path.getsize(src)
++    return sorted(jobs, key=source_size, reverse=True)
++
++
++def compile_all(jobs, what):
++    if not jobs:
++        print(f"{what}: up to date")
++        return True
++    t0 = time.time()
++    failures = []
++    with ThreadPoolExecutor(JOBS) as pool:
++        futures = [pool.submit(compile_one, job) for job in in_order(jobs)]
++        for done, fut in enumerate(as_completed(futures), 1):
++            r = fut.result()
++            if r:
++                failures.append(r)
++            if done % 64 == 0 or done == len(jobs):
++                print(f"{what}: {done}/{len(jobs)} compiled, {len(failures)} failed, {time.time() - t0:,.0f}s", flush=True)
++    for src, err in failures[:12]:
++        print(f"FAILED {src}:\n{err[:4000]}")
++    return not failures
++
++
++def write_objects():
++    """<out>/objects.rsp (every object, for the eboot's link) and the size of the code."""
++    objs = sorted(os.path.join(OUT, "rt", n) for n in os.listdir(os.path.join(OUT, "rt")) if n.endswith(".o"))
++    for _name, _src, out_dir in modules():
++        if os.path.isdir(out_dir):
++            objs += sorted(os.path.join(out_dir, n) for n in os.listdir(out_dir) if n.endswith(".o"))
++    with open(os.path.join(OUT, "objects.rsp"), "w", newline="\n") as f:
++        f.write("\n".join(objs) + "\n")
++    print(f"{len(objs)} objects, {sum(os.path.getsize(o) for o in objs) / 1048576:,.0f} MB: {os.path.join(OUT, 'objects.rsp')}")
++
++
++def main():
++    os.makedirs(OUT, exist_ok=True)
++    overlay_font()
++    if not compile_all(runtime_jobs(), "runtime"):
++        return False
++    if "--runtime-only" not in sys.argv:
++        if not modules():
++            raise SystemExit(f"no recompiled game in {os.path.join(PORT, 'build')} (tools/recomp.py all --generate-only)")
++        if not compile_all(game_jobs(), "game"):
++            return False
++    write_objects()
++    return True
++
++
++if __name__ == "__main__":
++    sys.exit(0 if main() else 1)
+diff --git a/tools/ps4/build_vkd3d_ps4.py b/tools/ps4/build_vkd3d_ps4.py
+new file mode 100644
+index 0000000..6e94aa0
+--- /dev/null
++++ b/tools/ps4/build_vkd3d_ps4.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""vkd3d-shader (HLSL -> DXBC: D3DCompile on the PS4, runtime/linux/d3dcompile_vkd3d.c) for the PS4, as a static
++library: tools/linux/build_vkd3d.py's build with the PS4 toolchain (tools/ps4/build_ps4.py's flags).
++
++Usage: build_vkd3d_ps4.py <vkd3d source> <SPIRV-Headers include dir> <out dir>
++The parsers are made by the system's bison and flex."""
++import glob
++import os
++import subprocess
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import build_ps4  # noqa: E402
++
++SRC, SPIRV, OUT = (os.path.abspath(a) for a in sys.argv[1:4])
++GEN = os.path.join(OUT, "gen")
++CONFIG = """#define HAVE_ATOMIC_EXCHANGE_N 1
++#define HAVE_BUILTIN_ADD_OVERFLOW 1
++#define HAVE_BUILTIN_CLZ 1
++#define HAVE_BUILTIN_CTZ 1
++#define HAVE_BUILTIN_POPCOUNT 1
++#define HAVE_INTTYPES_H 1
++#define HAVE_STDINT_H 1
++#define HAVE_STDIO_H 1
++#define HAVE_STDLIB_H 1
++#define HAVE_STRING_H 1
++#define HAVE_SYNC_ADD_AND_FETCH 1
++#define HAVE_SYNC_BOOL_COMPARE_AND_SWAP 1
++#define HAVE_SPIRV_UNIFIED1_SPIRV_H 1
++#define HAVE_SPIRV_UNIFIED1_GLSL_STD_450_H 1
++#define HAVE_PTHREAD_H 1
++#define HAVE_STRINGS_H 1
++#define HAVE_SYS_STAT_H 1
++#define HAVE_SYS_TYPES_H 1
++#define HAVE_UNISTD_H 1
++#define HAVE_WCHAR_H 1
++#define PACKAGE_NAME "vkd3d"
++#define PACKAGE_VERSION "2.1"
++#define PACKAGE_STRING "vkd3d 2.1"
++#define PACKAGE_BUGREPORT ""
++#define PACKAGE_TARNAME "vkd3d"
++#define PACKAGE_URL ""
++#define VERSION "2.1"
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++"""
++
++
++def main():
++    os.makedirs(GEN, exist_ok=True)
++    shader_dir = os.path.join(SRC, "libs", "vkd3d-shader")
++    for name in ("hlsl", "preproc"):
++        if not os.path.exists(os.path.join(GEN, name + ".tab.c")):
++            subprocess.run(["bison", "-d", "-o", name + ".tab.c", os.path.join(shader_dir, name + ".y")], cwd=GEN, check=True)
++        if not os.path.exists(os.path.join(GEN, name + ".yy.c")):
++            subprocess.run(["flex", "-o", name + ".yy.c", os.path.join(shader_dir, name + ".l")], cwd=GEN, check=True)
++    with open(os.path.join(GEN, "vkd3d_version.h"), "w") as f:
++        f.write('#define VKD3D_VCS_ID ""\n')
++    inc = os.path.join(OUT, "include")
++    os.makedirs(inc, exist_ok=True)
++    with open(os.path.join(inc, "config.h"), "w") as f:
++        f.write(CONFIG)
++    shader = sorted(glob.glob(os.path.join(shader_dir, "*.c")))
++    common = [os.path.join(SRC, "libs", "vkd3d-common", n) for n in ("debug.c", "error.c", "memory.c", "utf8.c")]
++    gen = [os.path.join(GEN, n) for n in ("hlsl.tab.c", "hlsl.yy.c", "preproc.tab.c", "preproc.yy.c")]
++    flags = ["-I", inc, "-I", GEN, "-I", os.path.join(SRC, "include"), "-I", os.path.join(SRC, "include", "private"),
++             "-I", shader_dir, "-I", SPIRV, "-DLIBVKD3D_SHADER_SOURCE", "-DVKD3D_NO_VULKAN_H",
++             "-DVKD3D_DEBUG_ENV=VKD3D_SHADER_DEBUG", "-DNDEBUG", "-std=gnu11", "-include",
++             os.path.join(build_ps4.RUNTIME, "ps4", "include", "ps4_compat.h")]
++    srcs = shader + common + gen
++    jobs = [(s, os.path.join(OUT, "obj", os.path.basename(s)[:-2] + ".o"), "-O2", flags) for s in srcs]
++    if not build_ps4.compile_all(jobs, "vkd3d-shader"):
++        return False
++    lib = os.path.join(OUT, "libvkd3d-shader.a")
++    if os.path.exists(lib):
++        os.remove(lib)
++    subprocess.run(["llvm-ar-21", "rcs", lib, *[j[1] for j in jobs]], check=True)
++    print(f"{lib} ({os.path.getsize(lib) / 1048576:.1f} MB)")
++    return True
++
++
++if __name__ == "__main__":
++    sys.exit(0 if main() else 1)
