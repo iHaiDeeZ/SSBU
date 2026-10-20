@@ -728,10 +728,10 @@ index 0000000..267d2cd
 +#endif
 diff --git a/runtime/ps4/memory.c b/runtime/ps4/memory.c
 new file mode 100644
-index 0000000..f666172
+index 0000000..d6e25f2
 --- /dev/null
 +++ b/runtime/ps4/memory.c
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,659 @@
 +/* Memory for the PS4 build of the Windows API (runtime/linux/include/windows.h): VirtualAlloc and
 + * the rest, and the write watch - what runtime/linux/win32.c does on Linux and runtime/macos/
 + * memory.c on macOS, for a system with no demand-zero memory to speak of (the SMW port's design,
@@ -748,8 +748,10 @@ index 0000000..f666172
 + * blocks (smaller pieces when it is fragmented) and handed out by chunk.
 + *
 + * Reservations with no address of their own (VirtualAlloc(NULL, ...): thread stacks, the
-+ * runtime's copies of module code) come from a host range of 16 GiB above the guest's,
-+ * [0x7800000000, 0x7C00000000): the guest's own ranges (host.h) end at 0x7781000000.
++ * runtime's copies of module code, the NROs' code) come from a host range of 16 GiB,
++ * [0x5000000000, 0x5400000000): between RADV's GPU windows ([0x4000000000, 0x4500000000), the PS4
++ * winsys's) and the guest's lowest range (the alias area at 0x6000000000; host.h: the guest's go up
++ * to 0x7800000000 and beyond, its shared fonts there - v00.06's host range at 0x7800000000 took it).
 + *
 + * The write watch is page protection, as on macOS (16 KiB host pages, 4 KiB guest pages): a
 + * watched area's chunks are mapped read-only; the first write to a host page faults, and the
@@ -791,8 +793,8 @@ index 0000000..f666172
 +#define PROT_RW 0x3
 +#define WB_ONION 0
 +
-+#define HOST_BASE 0x7800000000ull
-+#define HOST_END 0x7C00000000ull
++#define HOST_BASE 0x5000000000ull
++#define HOST_END 0x5400000000ull
 +#define MAX_AREAS 1024
 +#define MAX_FREE (1u << 17)   /* freed chunks kept for reuse (8 GiB worth) */
 +
