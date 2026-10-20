@@ -41,6 +41,10 @@ extern "C" void ps4_port_start() {
     setenv("DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary = True", 0);
     // the renderer's details (frame times, draws, uploads, shaders compiling) in the log every 5 s
     setenv("SSBU_LOG_STATS", "1", 0);
+    // the game's clock (it reads it thousands of times a frame) straight from the CPU's counter, not
+    // through QueryPerformanceCounter and clock_gettime: v00.09's profile had the guest main thread
+    // spend a tenth of its time in those
+    setenv("SSBU_CLOCK", "tsc", 0);
     ps4_profile_thread_begin();   // (the main thread: the others from their start)
     if (std::FILE* conf = std::fopen("/data/SSBU/dxvk.conf", "r")) {
         std::fclose(conf);

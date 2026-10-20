@@ -211,7 +211,7 @@ index cbd4af5..fffc7d7 100644
  }
  static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
 diff --git a/runtime/linux/win32.c b/runtime/linux/win32.c
-index b56617b..10b8d64 100644
+index b56617b..9b12b93 100644
 --- a/runtime/linux/win32.c
 +++ b/runtime/linux/win32.c
 @@ -22,7 +22,7 @@
@@ -293,7 +293,7 @@ index b56617b..10b8d64 100644
  }
  #endif
  
-@@ -432,18 +452,66 @@ HANDLE GetCurrentProcess(void) { return PSEUDO_PROCESS; }
+@@ -432,18 +452,65 @@ HANDLE GetCurrentProcess(void) { return PSEUDO_PROCESS; }
  /* A signal stack for every thread we start, so that a fault report (stack overflows included)
   * has room to run. */
  void rt_thread_signal_stack(void) {
@@ -310,7 +310,6 @@ index b56617b..10b8d64 100644
 +void *rt_ps4_stack(size_t size, size_t eager);   /* (runtime/ps4/memory.c) */
 +int ps4_thread_rename(void *thread, const char *name) __asm__("scePthreadRename");
 +void *ps4_thread_self(void) __asm__("scePthreadSelf");
-+int ps4_thread_setprio(void *thread, int prio) __asm__("scePthreadSetprio");
 +
 +/* A thread's stack is reused by a later thread of the same size, its pages mapped already: guest
 + * threads come and go all the time, each with a 256 MiB stack (kernel.c HOST_STACK), and the host
@@ -360,7 +359,7 @@ index b56617b..10b8d64 100644
      forget_description(o->tid);
      obj_signal(o);
      obj_release(o);   /* (the thread's own reference) */
-@@ -461,7 +529,16 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
+@@ -461,7 +528,16 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
      pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
      if (!stack) stack = 8u << 20;
      stack = (stack + 0xFFFF) & ~(SIZE_T)0xFFFF;
@@ -377,7 +376,7 @@ index b56617b..10b8d64 100644
  #ifdef __APPLE__
      /* The game's threads (the guest's, the renderer, audio, input) keep pace with frames: on
       * Apple silicon a thread's class decides between the performance and efficiency cores.
-@@ -549,7 +626,11 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
+@@ -549,7 +625,11 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
      set_description(tid, text);
      char shortname[16];
      snprintf(shortname, sizeof shortname, "%s", text);
@@ -389,26 +388,23 @@ index b56617b..10b8d64 100644
      return S_OK;
  }
  
-@@ -557,7 +638,18 @@ BOOL SetThreadPriority(HANDLE thread, int priority) {
+@@ -557,7 +637,15 @@ BOOL SetThreadPriority(HANDLE thread, int priority) {
      RtTid tid = thread == PSEUDO_THREAD ? self_tid() : rt_thread_tid(thread);
      if (!tid) return FALSE;
      int nice = priority <= THREAD_PRIORITY_LOWEST ? 5 : priority == THREAD_PRIORITY_BELOW_NORMAL ? 2 : 0;
 +#ifndef __ORBIS__
      setpriority(PRIO_PROCESS, (id_t)tid, nice);   /* (raising priority needs privileges: left as it is) */
 +#else
-+    /* libkernel's (256 highest .. 767 lowest; 700 every thread's to begin with): the shader
-+     * compilers below the game, which skips a draw whose shaders are not ready, so that compiling
-+     * no longer takes the game's time; the renderer ("gpu") and input above it. */
-+    (void)nice;
-+    int prio = priority >= THREAD_PRIORITY_TIME_CRITICAL ? 640 : priority >= THREAD_PRIORITY_HIGHEST ? 660
-+             : priority > THREAD_PRIORITY_NORMAL ? 680 : priority == THREAD_PRIORITY_NORMAL ? 700
-+             : priority == THREAD_PRIORITY_BELOW_NORMAL ? 720 : 740;
-+    ps4_thread_setprio(thread == PSEUDO_THREAD ? ps4_thread_self() : (void *)rt_thread_pthread(thread), prio);
++    /* Priorities stay as they are (700): libkernel's scheduler runs a higher priority first, always,
++     * and DXVK's and the runtime's spinlocks spin at their own; with the shader compilers lowered
++     * (and the renderer raised), v00.09 froze in its first match - a lock's holder that never ran
++     * again. */
++    (void)nice; (void)priority;
 +#endif
      return TRUE;
  }
  #endif
-@@ -650,9 +742,14 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
+@@ -650,9 +738,14 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
      (void)flags;
      size_t size = reserve ? reserve : commit ? commit : (1u << 20);
      size = (size + 0xFFFF) & ~(size_t)0xFFFF;
@@ -423,7 +419,7 @@ index b56617b..10b8d64 100644
      Fiber *f = calloc(1, sizeof *f);
      f->fn = fn;
      f->param = param;
-@@ -685,7 +782,11 @@ void SwitchToFiber(LPVOID fiber) {
+@@ -685,7 +778,11 @@ void SwitchToFiber(LPVOID fiber) {
  void DeleteFiber(LPVOID fiber) {
      Fiber *f = fiber;
      if (!f || f == current_fiber) return;
@@ -435,7 +431,7 @@ index b56617b..10b8d64 100644
      free(f);
  }
  BOOL IsThreadAFiber(void) { return current_fiber != NULL; }
-@@ -758,7 +859,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
+@@ -758,7 +855,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
  }
  
  /* ---- memory ------------------------------------------------------------------------------- */
@@ -444,7 +440,7 @@ index b56617b..10b8d64 100644
  #define PAGE 4096ull
  static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
  typedef struct Reservation { u64 base, size; int watch; } Reservation;
-@@ -899,7 +1000,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
+@@ -899,7 +996,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
  }
  
  /* ---- the write watch ---------------------------------------------------------------------- */
@@ -453,7 +449,7 @@ index b56617b..10b8d64 100644
  #ifndef UFFD_USER_MODE_ONLY
  #define UFFD_USER_MODE_ONLY 1
  #endif
-@@ -1157,8 +1258,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
+@@ -1157,8 +1254,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
      return o;
  }
  
@@ -464,7 +460,7 @@ index b56617b..10b8d64 100644
  
  /* The read through a host buffer, a megabyte at a time, copied into buf by stores: a store to a
   * protected page faults, and the fault handler lets it through (rt_ww_fault), however often the
-@@ -1190,7 +1291,7 @@ static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int posit
+@@ -1190,7 +1287,7 @@ static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int posit
   * having filled the pages before (read() moving the file offset on by those) - so the read goes
   * back to where it started and through a host buffer. */
  static ssize_t read_some(int fd, void *buf, size_t n, off_t offset, int positional) {
@@ -473,7 +469,7 @@ index b56617b..10b8d64 100644
      off_t start = positional ? offset : lseek(fd, 0, SEEK_CUR);
      ssize_t r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
      if (r >= 0 || errno != EFAULT) return r;
-@@ -1384,6 +1485,8 @@ errno_t rand_s(unsigned int *value) {
+@@ -1384,6 +1481,8 @@ errno_t rand_s(unsigned int *value) {
  #ifdef __APPLE__
      arc4random_buf(value, sizeof *value);
      return 0;
@@ -482,7 +478,7 @@ index b56617b..10b8d64 100644
  #else
      return getrandom(value, sizeof *value, 0) == (ssize_t)sizeof *value ? 0 : EIO;
  #endif
-@@ -1397,6 +1500,10 @@ void ExitProcess(UINT code) {
+@@ -1397,6 +1496,10 @@ void ExitProcess(UINT code) {
  #ifdef __APPLE__   /* (the program's Mach-O header: where it is loaded) */
  HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
  HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }

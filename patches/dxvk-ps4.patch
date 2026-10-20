@@ -207,28 +207,17 @@ index c1507b4..371a2eb 100644
    }
  
 diff --git a/src/util/thread.h b/src/util/thread.h
-index ae6f01d..44c8512 100644
+index ae6f01d..60fc5b8 100644
 --- a/src/util/thread.h
 +++ b/src/util/thread.h
-@@ -15,6 +15,10 @@
- #include "./rc/util_rc.h"
- #include "./rc/util_rc_ptr.h"
- 
-+#ifdef DXVK_PS4
-+extern "C" int scePthreadSetprio(void* thread, int prio);   // libkernel
-+#endif
-+
- namespace dxvk {
- 
-   /**
-@@ -361,6 +365,12 @@ namespace dxvk {
+@@ -361,6 +361,12 @@ namespace dxvk {
      using std::thread::thread;
  
      void set_priority(ThreadPriority priority) {
 +#ifdef DXVK_PS4
-+      // libkernel's priorities (256 highest .. 767 lowest, 700 the default): the POSIX call
-+      // with priority 0 means something else there
-+      ::scePthreadSetprio(reinterpret_cast<void*>(this->native_handle()), priority == ThreadPriority::Lowest ? 740 : 700);
++      // left at libkernel's default (700): its scheduler always runs a higher priority first, and
++      // a lowered worker holding a spinlock others spin on never ran again (v00.09's freeze)
++      (void)priority;
 +      return;
 +#endif
        ::sched_param param = {};
