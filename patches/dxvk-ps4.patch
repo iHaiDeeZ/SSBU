@@ -1,0 +1,395 @@
+diff --git a/meson.build b/meson.build
+index 4964301..fa86e2f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -149,9 +149,13 @@ else
+     './include/native/directx'
+   ]
+ 
+-  lib_sdl3 = dependency('sdl3', required: get_option('native_sdl3'))
+-  lib_sdl2 = dependency('sdl2', required: get_option('native_sdl2'))
+-  lib_glfw = dependency('glfw3', required: get_option('native_glfw'))
++  dxvk_ps4 = get_option('native_ps4')
++  lib_sdl3 = dependency('sdl3', required: dxvk_ps4 ? false : get_option('native_sdl3'))
++  lib_sdl2 = dependency('sdl2', required: dxvk_ps4 ? false : get_option('native_sdl2'))
++  lib_glfw = dependency('glfw3', required: dxvk_ps4 ? false : get_option('native_glfw'))
++  if dxvk_ps4
++    compiler_args += ['-DDXVK_WSI_PS4', '-DDXVK_PS4']
++  endif
+   if lib_sdl3.found()
+     compiler_args += ['-DDXVK_WSI_SDL3']
+   endif
+@@ -161,18 +165,25 @@ else
+   if lib_glfw.found()
+     compiler_args += ['-DDXVK_WSI_GLFW']
+   endif
+-  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
++  if (not dxvk_ps4 and not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
+     error('SDL3, SDL2, or GLFW are required to build dxvk-native')
+   endif
+   
+   dxvk_name_prefix = 'dxvk_'
+   dxvk_pkg_prefix = 'dxvk-'
+ 
+-  link_args += [
+-    '-static-libgcc',
+-    '-static-libstdc++',
+-  ]
++  if not dxvk_ps4
++    link_args += [
++      '-static-libgcc',
++      '-static-libstdc++',
++    ]
++  endif
++endif
++if platform == 'windows'
++  dxvk_ps4 = false
+ endif
++# PS4: the API libraries are static archives linked into the eboot
++dxvk_lib_type = dxvk_ps4 ? 'static_library' : 'shared_library'
+ 
+ dxbc_spirv = subproject('dxbc-spirv')
+ dxbc_spirv_dep = dxbc_spirv.get_variable('dxbc_spv_dep')
+diff --git a/meson_options.txt b/meson_options.txt
+index 98851af..46faaee 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -4,6 +4,7 @@ option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9'
+ option('enable_d3d10', type : 'boolean', value : true, description: 'Build D3D10')
+ option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
+ option('build_id',     type : 'boolean', value : false)
++option('native_ps4',   type : 'boolean', value : false, description: 'PS4 (SSBU port): static libraries, VideoOut WSI, the app\'s Vulkan entry point')
+ option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')
+ option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SDL2 WSI for DXVK Native')
+ option('native_sdl3',  type : 'feature', value : 'auto', description: 'Enable SDL3 WSI for DXVK Native')
+diff --git a/src/d3d11/meson.build b/src/d3d11/meson.build
+index af2b7b2..6eb4356 100644
+--- a/src/d3d11/meson.build
++++ b/src/d3d11/meson.build
+@@ -79,23 +79,32 @@ else
+   d3d11_dxgi_deps = [ dxgi_dep ]
+ endif
+ 
+-d3d11_dll = shared_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src + d3d10_src,
+-    glsl_generator.process(d3d11_shaders), d3d11_res,
+-  dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
+-  include_directories : dxvk_include_path,
+-  install             : true,
+-  vs_module_defs      : 'd3d11'+def_spec_ext,
+-  link_args           : d3d11_ld_args,
+-  link_depends        : [ d3d11_link_depends ],
+-  kwargs              : dxvk_so_version,
+-)
++if dxvk_ps4
++  # PS4 (SSBU port): a static archive linked into the eboot
++  d3d11_dll = static_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src + d3d10_src,
++    glsl_generator.process(d3d11_shaders),
++    dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
++    include_directories : dxvk_include_path,
++  )
++else
++  d3d11_dll = shared_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src + d3d10_src,
++      glsl_generator.process(d3d11_shaders), d3d11_res,
++    dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
++    include_directories : dxvk_include_path,
++    install             : true,
++    vs_module_defs      : 'd3d11'+def_spec_ext,
++    link_args           : d3d11_ld_args,
++    link_depends        : [ d3d11_link_depends ],
++    kwargs              : dxvk_so_version,
++  )
++endif
+ 
+ d3d11_dep = declare_dependency(
+   link_with           : [ d3d11_dll ],
+   include_directories : [ dxvk_include_path ],
+ )
+ 
+-if platform != 'windows'
++if platform != 'windows' and not dxvk_ps4
+   pkg.generate(d3d11_dll,
+     filebase: dxvk_pkg_prefix + 'd3d11',
+     subdirs:  'dxvk',
+diff --git a/src/dxgi/meson.build b/src/dxgi/meson.build
+index a9ed5e7..420fa6a 100644
+--- a/src/dxgi/meson.build
++++ b/src/dxgi/meson.build
+@@ -24,22 +24,30 @@ else
+   dxgi_link_depends += files('dxgi.sym')
+ endif
+ 
+-dxgi_dll = shared_library(dxvk_name_prefix+'dxgi', dxgi_src, dxgi_res,
+-  dependencies        : [ dxvk_dep, dxgi_extra_dep ],
+-  include_directories : dxvk_include_path,
+-  install             : true,
+-  vs_module_defs      : 'dxgi'+def_spec_ext,
+-  link_args           : dxgi_ld_args,
+-  link_depends        : [ dxgi_link_depends ],
+-  kwargs              : dxvk_so_version,
+-)
++if dxvk_ps4
++  # PS4 (SSBU port): a static archive linked into the eboot
++  dxgi_dll = static_library(dxvk_name_prefix+'dxgi', dxgi_src,
++    dependencies        : [ dxvk_dep, dxgi_extra_dep ],
++    include_directories : dxvk_include_path,
++  )
++else
++  dxgi_dll = shared_library(dxvk_name_prefix+'dxgi', dxgi_src, dxgi_res,
++    dependencies        : [ dxvk_dep, dxgi_extra_dep ],
++    include_directories : dxvk_include_path,
++    install             : true,
++    vs_module_defs      : 'dxgi'+def_spec_ext,
++    link_args           : dxgi_ld_args,
++    link_depends        : [ dxgi_link_depends ],
++    kwargs              : dxvk_so_version,
++  )
++endif
+ 
+ dxgi_dep = declare_dependency(
+   link_with           : [ dxgi_dll ],
+   include_directories : [ dxvk_include_path ],
+ )
+ 
+-if platform != 'windows'
++if platform != 'windows' and not dxvk_ps4
+   pkg.generate(dxgi_dll,
+     filebase: dxvk_pkg_prefix + 'dxgi',
+     subdirs:  'dxvk',
+diff --git a/src/util/util_math.h b/src/util/util_math.h
+index 9276d93..a712940 100644
+--- a/src/util/util_math.h
++++ b/src/util/util_math.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cmath>
++#include <cstddef>
+ 
+ namespace dxvk {
+   
+diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
+index f9d1e98..5380789 100644
+--- a/src/vulkan/vulkan_loader.cpp
++++ b/src/vulkan/vulkan_loader.cpp
+@@ -7,9 +7,17 @@
+ #include "../util/util_string.h"
+ #include "../util/util_win32_compat.h"
+ 
++#if defined(DXVK_PS4)
++// The app's vkGetInstanceProcAddr: RADV plus the VideoOut surface and swapchain (port/ps4_vk_wsi.cpp).
++extern "C" PFN_vkGetInstanceProcAddr dxvk_ps4_vk_get_instance_proc_addr(void);
++#endif
++
+ namespace dxvk::vk {
+ 
+   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
++#if defined(DXVK_PS4)
++    return std::make_pair(HMODULE(nullptr), dxvk_ps4_vk_get_instance_proc_addr());
++#endif
+     static const std::array<const char*, 2> dllNames = {{
+ #ifdef _WIN32
+       "winevulkan.dll",
+diff --git a/src/wsi/meson.build b/src/wsi/meson.build
+index 1d88e2c..d7ba6da 100644
+--- a/src/wsi/meson.build
++++ b/src/wsi/meson.build
+@@ -13,6 +13,7 @@ wsi_src = [
+   'glfw/wsi_monitor_glfw.cpp',
+   'glfw/wsi_platform_glfw.cpp',
+   'glfw/wsi_window_glfw.cpp',
++  'ps4/wsi_platform_ps4.cpp',
+ ]
+ 
+ wsi_deps = [ dep_displayinfo ]
+diff --git a/src/wsi/ps4/wsi_platform_ps4.cpp b/src/wsi/ps4/wsi_platform_ps4.cpp
+new file mode 100644
+index 0000000..b899894
+--- /dev/null
++++ b/src/wsi/ps4/wsi_platform_ps4.cpp
+@@ -0,0 +1,146 @@
++#if defined(DXVK_WSI_PS4)
++
++// PS4 (SSBU port): one screen, 1920x1080 at 60 Hz, and one "window" covering it. Any non-null HWND is that window.
++// The surface is VK_EXT_headless_surface, which the app's Vulkan entry point (dxvk_ps4_vk_get_instance_proc_addr,
++// the SMW port's ps4_vk_wsi on top of the statically linked RADV) turns into VideoOut buffers and flips.
++
++#include "../wsi_platform.h"
++#include "../wsi_monitor.h"
++#include "../wsi_window.h"
++
++#include "../../util/util_error.h"
++#include "../../util/util_string.h"
++#include "../../util/log/log.h"
++
++#include <cstring>
++
++namespace dxvk::wsi {
++
++  namespace {
++    constexpr uint32_t kWidth  = 1920;
++    constexpr uint32_t kHeight = 1080;
++    HMONITOR const kMonitor = reinterpret_cast<HMONITOR>(uintptr_t(1));
++
++    void screenMode(WsiMode* pMode) {
++      pMode->width        = kWidth;
++      pMode->height       = kHeight;
++      pMode->refreshRate  = WsiRational { 60, 1 };
++      pMode->bitsPerPixel = 32;
++      pMode->interlaced   = false;
++    }
++  }
++
++  class Ps4WsiDriver : public WsiDriver {
++  public:
++    std::vector<const char *> getInstanceExtensions() override {
++      return { VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME };
++    }
++
++    HMONITOR getDefaultMonitor() override { return kMonitor; }
++
++    HMONITOR enumMonitors(uint32_t index) override { return index == 0 ? kMonitor : nullptr; }
++
++    HMONITOR enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index) override {
++      return enumMonitors(index);
++    }
++
++    bool getDisplayName(HMONITOR hMonitor, WCHAR (&Name)[32]) override {
++      if (hMonitor != kMonitor)
++        return false;
++      static const WCHAR name[] = L"\\\\.\\DISPLAY1";
++      std::memset(Name, 0, sizeof(Name));
++      std::memcpy(Name, name, sizeof(name));
++      return true;
++    }
++
++    bool getDesktopCoordinates(HMONITOR hMonitor, RECT* pRect) override {
++      if (hMonitor != kMonitor)
++        return false;
++      pRect->left = 0;
++      pRect->top = 0;
++      pRect->right = LONG(kWidth);
++      pRect->bottom = LONG(kHeight);
++      return true;
++    }
++
++    bool getDisplayMode(HMONITOR hMonitor, uint32_t modeNumber, WsiMode* pMode) override {
++      if (hMonitor != kMonitor || modeNumber != 0)
++        return false;
++      screenMode(pMode);
++      return true;
++    }
++
++    bool getCurrentDisplayMode(HMONITOR hMonitor, WsiMode* pMode) override {
++      return getDisplayMode(hMonitor, 0, pMode);
++    }
++
++    bool getDesktopDisplayMode(HMONITOR hMonitor, WsiMode* pMode) override {
++      return getDisplayMode(hMonitor, 0, pMode);
++    }
++
++    WsiEdidData getMonitorEdid(HMONITOR hMonitor) override { return {}; }
++
++    void getWindowSize(HWND hWindow, uint32_t* pWidth, uint32_t* pHeight) override {
++      if (pWidth)
++        *pWidth = kWidth;
++      if (pHeight)
++        *pHeight = kHeight;
++    }
++
++    void resizeWindow(HWND hWindow, DxvkWindowState* pState, uint32_t width, uint32_t height) override { }
++
++    void saveWindowState(HWND hWindow, DxvkWindowState* pState, bool saveStyle) override { }
++
++    void restoreWindowState(HWND hWindow, DxvkWindowState* pState, bool restoreCoordinates) override { }
++
++    bool setWindowMode(HMONITOR hMonitor, HWND hWindow, DxvkWindowState* pState, const WsiMode& mode) override {
++      return hMonitor == kMonitor;
++    }
++
++    bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow, DxvkWindowState* pState, bool modeSwitch) override {
++      return hMonitor == kMonitor;
++    }
++
++    bool leaveFullscreenMode(HWND hWindow, DxvkWindowState* pState) override { return true; }
++
++    bool restoreDisplayMode() override { return true; }
++
++    HMONITOR getWindowMonitor(HWND hWindow) override { return kMonitor; }
++
++    bool isWindow(HWND hWindow) override { return hWindow != nullptr; }
++
++    bool isMinimized(HWND hWindow) override { return false; }
++
++    bool isOccluded(HWND hWindow) override { return false; }
++
++    void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, bool forceTopmost) override { }
++
++    VkResult createSurface(
++            HWND                      hWindow,
++            PFN_vkGetInstanceProcAddr pfnVkGetInstanceProcAddr,
++            VkInstance                instance,
++            VkSurfaceKHR*             pSurface) override {
++      auto create = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
++        pfnVkGetInstanceProcAddr(instance, "vkCreateHeadlessSurfaceEXT"));
++      if (!create) {
++        Logger::err("PS4 WSI: vkCreateHeadlessSurfaceEXT not found");
++        return VK_ERROR_EXTENSION_NOT_PRESENT;
++      }
++      VkHeadlessSurfaceCreateInfoEXT info = { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
++      return create(instance, &info, nullptr, pSurface);
++    }
++  };
++
++  static bool createPs4WsiDriver(WsiDriver **driver) {
++    *driver = new Ps4WsiDriver();
++    return true;
++  }
++
++  WsiBootstrap Ps4WSI = {
++    "PS4",
++    createPs4WsiDriver
++  };
++
++}
++
++#endif
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+index 08f456e..c9a8cba 100644
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -20,6 +20,9 @@ namespace dxvk::wsi {
+ #endif
+ #if defined(DXVK_WSI_GLFW)
+     &GlfwWSI,
++#endif
++#if defined(DXVK_WSI_PS4)
++    &Ps4WSI,
+ #endif
+   };
+ 
+@@ -33,6 +36,8 @@ namespace dxvk::wsi {
+         // for other platforms however we _need_ to know which WSI to use!
+ #if defined(DXVK_WSI_WIN32)
+         hint = "Win32";
++#elif defined(DXVK_WSI_PS4)
++        hint = "PS4";
+ #else
+         throw DxvkError("DXVK_WSI_DRIVER environment variable unset");
+ #endif
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+index f1fae3f..0b40bc8 100644
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -123,6 +123,9 @@ namespace dxvk::wsi {
+ #if defined(DXVK_WSI_GLFW)
+   extern WsiBootstrap GlfwWSI;
+ #endif
++#if defined(DXVK_WSI_PS4)
++  extern WsiBootstrap Ps4WSI;
++#endif
+ 
+   void init();
+   void quit();
+diff --git a/subprojects/.wraplock b/subprojects/.wraplock
+new file mode 100644
+index 0000000..e69de29
