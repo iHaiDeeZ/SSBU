@@ -65,8 +65,8 @@ extern "C" void ps4_crash_guest_info() {}
 int main() {
     mkdir("/data/SSBU", 0777);
     g_log = fopen("/data/SSBU/dxvk-test.log", "w");
-    logf("SSBU 00.01 starting: DXVK test");
-    ps4_boot_trace("SSBU 00.01 starting: DXVK test");
+    logf("SSBU 00.02 starting: DXVK test");
+    ps4_boot_trace("SSBU 00.02 starting: DXVK test");
     // DXVK: its log next to ours, the PS4 WSI, no state cache on the slow drive yet
     setenv("DXVK_LOG_PATH", "/data/SSBU", 1);
     setenv("DXVK_LOG_LEVEL", "info", 1);
