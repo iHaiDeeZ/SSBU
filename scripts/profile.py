@@ -88,9 +88,10 @@ def parse(path):
             cur = (line, [])
             threads.append(cur)
         elif line.startswith("  ") and cur is not None:
-            m = re.match(r"\s+(\d+) (elf|abs|mod) (\S+)( wait)?$", line)
+            m = re.match(r"\s+(\d+) (elf|abs|mod) (\S+)( wait)?((?: < (?:elf|abs|mod) \S+)*)$", line)
             if m:
-                cur[1].append((int(m.group(1)), m.group(2), m.group(3), bool(m.group(4))))
+                chain = tuple(re.findall(r" < (elf|abs|mod) (\S+)", m.group(5)))
+                cur[1].append((int(m.group(1)), m.group(2), m.group(3), bool(m.group(4)), chain))
         else:
             header.append(line)
             cur = None
@@ -103,14 +104,15 @@ def name_profile(path, elf, log):
     nros = nro_bases(log) if log else []
     elf_addrs, nro_addrs = [], collections.defaultdict(list)
     for _line, samples in threads:
-        for _n, kind, where, _w in samples:
-            if kind == "elf":
-                elf_addrs.append(tstart + int(where, 16))
-            elif kind == "abs":
-                a = int(where, 16)
-                for s, e, n in nros:
-                    if s <= a < e:
-                        nro_addrs[n].append(a - s)
+        for _n, kind0, where0, _w, chain in samples:
+            for kind, where in ((kind0, where0),) + chain:
+                if kind == "elf":
+                    elf_addrs.append(tstart + int(where, 16))
+                elif kind == "abs":
+                    a = int(where, 16)
+                    for s, e, n in nros:
+                        if s <= a < e:
+                            nro_addrs[n].append(a - s)
     names = {("elf", a): v for a, v in symbolize(elf, elf_addrs).items()} if elf else {}
     for n, addrs in nro_addrs.items():
         so = os.path.join(NRO_SO, n + ".so")
@@ -126,7 +128,7 @@ def name_profile(path, elf, log):
                 if s <= a < e:
                     return names.get((n, a - s), f"{n}+{a - s:#x}")
             return "abs " + where
-        return re.sub(r"\+0x[0-9a-f]+$", "", where)   # (a system module: by module)
+        return where   # (a system module: module+offset, the offset kept: its code is in the profile's "code" lines)
 
     out_path = re.sub(r"\.txt$", "", path) + ".named.txt"
     total = collections.Counter()
@@ -135,8 +137,8 @@ def name_profile(path, elf, log):
         for line, samples in threads:
             per = collections.Counter()
             n = sum(c for c, *_ in samples)
-            for c, kind, where, waiting in samples:
-                key = fname(kind, where) + (" (waiting)" if waiting else "")
+            for c, kind, where, waiting, chain in samples:
+                key = fname(kind, where) + (" (waiting)" if waiting else "") + "".join(" <- " + fname(k, w) for k, w in chain)
                 per[key] += c
                 if not waiting:
                     total[key] += c

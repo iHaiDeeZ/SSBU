@@ -38,11 +38,11 @@ namespace {
 
 constexpr int kSigProf = 27;   // FreeBSD
 constexpr int kSaOnstack = 0x0001, kSaRestart = 0x0002, kSaSiginfo = 0x0040;
-constexpr int kMcontextOffset = 0x40, kRipIndex = 20;   // measured on hardware (ps4_crashlog.cpp)
+constexpr int kMcontextOffset = 0x40, kRipIndex = 20, kRspIndex = 23;   // measured on hardware (ps4_crashlog.cpp)
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kSystemEnd = 0x1000000000ULL;
 constexpr uintptr_t kTextWindow = 0x40000000;
 constexpr uint64_t kWaitingTag = 1ULL << 63;
-constexpr int kSlots = 256, kRing = 2048;   // threads alive at once; samples a thread per profile
+constexpr int kSlots = 128, kRing = 2048, kCallers = 3;   // threads alive at once; samples a thread per profile
 constexpr long kPeriodNs = 4000000;         // a round every 4 ms
 
 enum : uint32_t { kFree, kAlive, kEnded };   // kEnded: the thread is gone, its samples not yet written
@@ -58,8 +58,10 @@ struct Slot {
     int tid = 0;
     bool checked = false, sampled = false;   // (this profile: its name looked at)
     char name[64] = {};
+    uintptr_t stack_top = 0;   // (its stack, as far as a scan may read: its start's frame)
     std::atomic<uint32_t> count{0};
     uint64_t samples[kRing];
+    uint64_t callers[kRing][kCallers];   // in a system module: the eboot code that called into it, innermost first
 };
 Slot g_slots[kSlots];
 std::atomic<bool> g_running{false}, g_busy{false};   // busy: from the start until it is written
@@ -73,16 +75,35 @@ void onProf(int, siginfo_t*, void* context) {
         return;
     Slot& s = g_slots[i];
     const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
-    uint64_t rip = regs[kRipIndex];
-    // in a system module, right after a `syscall` (0f 05): waiting in the kernel
+    uint64_t rip = regs[kRipIndex], callers[kCallers] = {};
+    int ncallers = 0;
+    // in a system module, right after a `syscall` (0f 05): waiting in the kernel. And the eboot code
+    // that called in: the first return address into the eboot's code on the stack (one after a call
+    // instruction), within its stack (a fiber's: the next 4 KiB; 16 KiB at most)
     if (rip >= kSystemLibs && rip < kSystemEnd) {
+        // (or on it: a blocking call the signal interrupted is restarted, the thread put back on its
+        // `syscall` - libkernel's _umtx_op stub, its mutex and condition variable waits, at +0x371a)
         const auto* code = reinterpret_cast<const uint8_t*>(rip);
-        if ((rip & 0xFFF) >= 2 && code[-2] == 0x0F && code[-1] == 0x05)
+        if (((rip & 0xFFF) >= 2 && code[-2] == 0x0F && code[-1] == 0x05) || (code[0] == 0x0F && code[1] == 0x05))
             rip |= kWaitingTag;
+        const uintptr_t rsp = regs[kRspIndex], text = reinterpret_cast<uintptr_t>(__text_start);
+        const uintptr_t limit = std::min<uintptr_t>(rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : rsp + 4096,
+                                                    rsp + 16384);
+        for (uintptr_t at = rsp & ~7ull; at + 8 <= limit && ncallers < kCallers; at += 8) {
+            const uint64_t v = *reinterpret_cast<const uint64_t*>(at);
+            if (v < text + 8 || v >= text + kTextWindow)
+                continue;
+            const auto* r = reinterpret_cast<const uint8_t*>(v);
+            if (r[-5] == 0xE8 || (r[-6] == 0xFF && r[-5] == 0x15) || (r[-2] == 0xFF && (r[-1] & 0x38) == 0x10) ||
+                (r[-3] == 0xFF && (r[-2] & 0x38) == 0x10))
+                callers[ncallers++] = v;
+        }
     }
     const uint32_t n = s.count.load(std::memory_order_relaxed);
     if (n < kRing) {
         s.samples[n] = rip;
+        for (int k = 0; k < kCallers; k++)
+            s.callers[n][k] = callers[k];
         s.count.store(n + 1, std::memory_order_release);
     }
 }
@@ -164,11 +185,37 @@ void describe(uint64_t rip, char* out, size_t n) {
 }
 
 struct Entry {
+    uint64_t rip, caller[kCallers];
+    uint32_t count;
+};
+bool sameSample(const Entry& a, const Entry& b) {
+    return a.rip == b.rip && !memcmp(a.caller, b.caller, sizeof(a.caller));
+}
+Entry g_sorted[kRing], g_entries[kRing];
+
+// The busiest system-module addresses of the whole profile, whose code is written with it (to read on
+// the PC which call each is: libkernel's are mostly system call stubs).
+struct HotSystem {
     uint64_t rip;
     uint32_t count;
 };
-uint64_t g_sorted[kRing];
-Entry g_entries[kRing];
+HotSystem g_hot_system[16];
+
+void noteHotSystem(uint64_t rip, uint32_t count) {
+    if (rip < kSystemLibs || rip >= kSystemEnd)
+        return;
+    int slot = -1;
+    for (int k = 0; k < 16; k++) {
+        if (g_hot_system[k].rip == rip) {
+            g_hot_system[k].count += count;
+            return;
+        }
+        if (slot < 0 || g_hot_system[k].count < g_hot_system[slot].count)
+            slot = k;
+    }
+    if (count > g_hot_system[slot].count)
+        g_hot_system[slot] = {rip, count};
+}
 
 void writeThread(FILE* f, Slot& s, uint32_t rounds) {
     const uint32_t n = std::min<uint32_t>(s.count.load(std::memory_order_acquire), kRing);
@@ -176,27 +223,56 @@ void writeThread(FILE* f, Slot& s, uint32_t rounds) {
         return;
     uint32_t waiting = 0;
     for (uint32_t i = 0; i < n; i++) {
-        g_sorted[i] = s.samples[i];
-        waiting += (g_sorted[i] & kWaitingTag) != 0;
+        g_sorted[i].rip = s.samples[i];
+        memcpy(g_sorted[i].caller, s.callers[i], sizeof(g_sorted[i].caller));
+        g_sorted[i].count = 1;
+        waiting += (g_sorted[i].rip & kWaitingTag) != 0;
     }
-    std::sort(g_sorted, g_sorted + n);
+    std::sort(g_sorted, g_sorted + n, [](const Entry& a, const Entry& b) {
+        return a.rip != b.rip ? a.rip < b.rip : memcmp(a.caller, b.caller, sizeof(a.caller)) < 0;
+    });
     uint32_t unique = 0;
     for (uint32_t i = 0; i < n;) {
         uint32_t j = i;
-        while (j < n && g_sorted[j] == g_sorted[i])
+        while (j < n && sameSample(g_sorted[j], g_sorted[i]))
             j++;
-        g_entries[unique++] = {g_sorted[i], j - i};
+        g_entries[unique] = g_sorted[i];
+        g_entries[unique++].count = j - i;
+        noteHotSystem(g_sorted[i].rip & ~kWaitingTag, j - i);
         i = j;
     }
     std::sort(g_entries, g_entries + unique, [](const Entry& a, const Entry& b) { return a.count > b.count; });
     fprintf(f, "thread %d \"%s\": %u samples of %u rounds, %.1f%% busy\n", s.tid, s.name, n, rounds,
             100.0 * (n - waiting) / n);
-    char where[96];
+    char where[96], from[300];
     for (uint32_t i = 0; i < unique && i < 400; i++) {
         if (g_entries[i].count < 2 && i >= 40)
             break;
         describe(g_entries[i].rip & ~kWaitingTag, where, sizeof(where));
-        fprintf(f, "  %5u %s%s\n", g_entries[i].count, where, (g_entries[i].rip & kWaitingTag) ? " wait" : "");
+        size_t len = 0;
+        from[0] = 0;
+        for (int k = 0; k < kCallers && g_entries[i].caller[k]; k++) {
+            len += snprintf(from + len, sizeof(from) - len, " < ");
+            describe(g_entries[i].caller[k], from + len, sizeof(from) - len);
+            len = strlen(from);
+        }
+        fprintf(f, "  %5u %s%s%s\n", g_entries[i].count, where, (g_entries[i].rip & kWaitingTag) ? " wait" : "", from);
+    }
+}
+
+void writeHotSystemCode(FILE* f) {
+    char where[96];
+    for (HotSystem& h : g_hot_system) {
+        if (!h.count)
+            continue;
+        describe(h.rip, where, sizeof(where));
+        // 48 bytes before it, 16 from it (system code is readable: the handler reads it too)
+        const uint64_t from = std::max<uint64_t>(h.rip - 48, h.rip & ~0xFFFull);
+        fprintf(f, "code %s (%u samples) from -0x%llx:", where, h.count, static_cast<unsigned long long>(h.rip - from));
+        for (uint64_t a = from; a < h.rip + 16; a++)
+            fprintf(f, " %02x", *reinterpret_cast<const uint8_t*>(a));
+        fprintf(f, "\n");
+        h = {};
     }
 }
 
@@ -270,6 +346,7 @@ void* profileThread(void* raw) {
             else
                 fprintf(f, "%s thread %d \"%s\"\n", left_alone++ ? "     " : "not sampled:", s.tid, s.name);
         }
+        writeHotSystemCode(f);
         fclose(f);
     }
     for (Slot& s : g_slots) {
@@ -310,6 +387,7 @@ extern "C" void ps4_profile_thread_begin() {
             g_slots[i].count.store(0);
             g_slots[i].name[0] = 0;
             g_slots[i].checked = g_slots[i].sampled = false;
+            g_slots[i].stack_top = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
             g_slots[i].tid = pthread_getthreadid_np();
             g_slots[i].thread.store(pthread_self());
             t_slot = i;
