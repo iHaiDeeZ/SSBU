@@ -1162,6 +1162,26 @@ index 0000000..95981a3
 +    _Unwind_Backtrace(walk_one, &w);
 +    return w.n;
 +}
+diff --git a/runtime/ps4/profile.c b/runtime/ps4/profile.c
+new file mode 100644
+index 0000000..d68cd18
+--- /dev/null
++++ b/runtime/ps4/profile.c
+@@ -0,0 +1,14 @@
++/* The sampling profiler (F6, SSBU_HITCH: runtime/linux/profile.c on Linux, by perf events and
++ * /proc) has nothing to sample with on the PS4: these say so and do nothing. (On SMW, signal-based
++ * sampling froze the game on the PS4.) */
++#include <stdio.h>
++
++#include "../debug_profile.h"
++
++void profile_start(double seconds) {
++    (void)seconds;
++    fprintf(stderr, "[profile] no sampling profiler on the PS4\n");
++}
++int profile_running(void) { return 0; }
++int profile_dump_threads(void (*line)(const char *text)) { (void)line; return 0; }
++void hitch_present(void) {}
 diff --git a/runtime/ps4/start.c b/runtime/ps4/start.c
 new file mode 100644
 index 0000000..f73d384
@@ -1284,7 +1304,7 @@ index 0000000..45e2fa5
 +    sys.exit(main())
 diff --git a/tools/ps4/build_ps4.py b/tools/ps4/build_ps4.py
 new file mode 100644
-index 0000000..b8aceb8
+index 0000000..6ce47e0
 --- /dev/null
 +++ b/tools/ps4/build_ps4.py
 @@ -0,0 +1,271 @@
@@ -1351,8 +1371,8 @@ index 0000000..b8aceb8
 +    RUNTIME_DEFINES += ["-DSSBU_HAVE_OPUS"]
 +if os.path.isfile(os.path.join(REPO, "third_party", "libvpx", "vp9", "vp9_dx_iface.c")):
 +    RUNTIME_DEFINES += ["-DSSBU_HAVE_VPX", "-I", os.path.join(REPO, "third_party", "libvpx")]
-+# Linux layer files the PS4 does not build: the window (SDL), the profiler (perf events), UPnP
-+LINUX_SKIP = {"window.c", "profile.c", "upnp.c"}
++# Linux layer files the PS4 does not build: the window (SDL) and the profiler (perf events): runtime/ps4's instead
++LINUX_SKIP = {"window.c", "profile.c"}
 +
 +
 +def run(cmd):
