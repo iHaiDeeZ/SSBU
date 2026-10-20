@@ -19,6 +19,14 @@ for f in "$M"/*.reloc.bin "$M/aoc.cfg" "$M/romfs.layers" "$M"/base-*.nca "$M/rom
     [ -f "$f" ] && link "$f" "$OUT/dump/modules/$(basename "$f")"
 done
 for f in "$WS"/dump/fonts/*.bfttf; do link "$f" "$OUT/dump/fonts/$(basename "$f")"; done
+# the NROs' code: a library each (tools/ps4/build_ps4.py), loaded by the eboot as the game loads the NRO
+# (the eboot's own code must fit in flexible memory: runtime/ps4/elfload.c)
+SO="${SSBU_OBJECTS:-$HOME/ssbu-build/build/ssbu}/nro-so"
+if [ -d "$SO" ]; then
+    mkdir -p "$OUT/dump/nro"
+    rm -f "$OUT"/dump/nro/*.so
+    for f in "$SO"/*.so; do link "$f" "$OUT/dump/nro/$(basename "$f")"; done
+fi
 # romfs.cfg: the same lines, with the console's paths for the files it names
 python3 - "$M/romfs.cfg" "$OUT/dump/modules/romfs.cfg" <<'EOF'
 import os, sys
