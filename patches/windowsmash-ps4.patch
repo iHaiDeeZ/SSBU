@@ -211,7 +211,7 @@ index cbd4af5..fffc7d7 100644
  }
  static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
 diff --git a/runtime/linux/win32.c b/runtime/linux/win32.c
-index b56617b..382ccbf 100644
+index b56617b..95d4a7c 100644
 --- a/runtime/linux/win32.c
 +++ b/runtime/linux/win32.c
 @@ -22,7 +22,7 @@
@@ -265,7 +265,18 @@ index b56617b..382ccbf 100644
  int rt_futex_wait(volatile int *addr, int value, DWORD ms);
  void rt_futex_wake(volatile int *addr, int all);
  
-@@ -276,8 +284,16 @@ static u64 monotonic_ns(void) {
+@@ -203,6 +211,10 @@ typedef struct Obj {
+     LPTHREAD_START_ROUTINE fn;
+     void *param;
+     int fd;                        /* files */
++#ifdef __ORBIS__
++    u8 *stack_base;                /* threads: the stack's reservation (runtime/ps4/memory.c), its size */
++    size_t stack_size;
++#endif
+     DIR *dir;                      /* searches */
+     u64 due_ns;                    /* timers: when (CLOCK_MONOTONIC), while armed */
+     int armed;
+@@ -276,8 +288,16 @@ static u64 monotonic_ns(void) {
  }
  
  static void sleep_until_ns(u64 t) {
@@ -282,7 +293,16 @@ index b56617b..382ccbf 100644
  }
  #endif
  
-@@ -438,6 +454,12 @@ void rt_thread_signal_stack(void) {
+@@ -432,18 +452,65 @@ HANDLE GetCurrentProcess(void) { return PSEUDO_PROCESS; }
+ /* A signal stack for every thread we start, so that a fault report (stack overflows included)
+  * has room to run. */
+ void rt_thread_signal_stack(void) {
++#ifdef __ORBIS__   /* (the port's pthread_create gives every thread one: port/ps4_crashlog.cpp) */
++    return;
++#endif
+     stack_t ss = {0};
+     ss.ss_size = 256 << 10;
+     ss.ss_sp = mmap(NULL, ss.ss_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
      if (ss.ss_sp != MAP_FAILED) sigaltstack(&ss, NULL);
  }
  
@@ -290,12 +310,56 @@ index b56617b..382ccbf 100644
 +void *rt_ps4_stack(size_t size, size_t eager);   /* (runtime/ps4/memory.c) */
 +int ps4_thread_rename(void *thread, const char *name) __asm__("scePthreadRename");
 +void *ps4_thread_self(void) __asm__("scePthreadSelf");
++
++/* A thread's stack is reused by a later thread of the same size, its pages mapped already: guest
++ * threads come and go all the time, each with a 256 MiB stack (kernel.c HOST_STACK), and the host
++ * range's address space would run out (v00.07: after ~2.5 minutes). A stack is taken again only
++ * a while after its thread let it go (it still runs on it to its end). */
++#define SPARE_STACKS 128
++static struct { u8 *base; size_t size; u64 since; } spare_stacks[SPARE_STACKS];
++static int nspare_stacks;
++static pthread_mutex_t spare_lock = PTHREAD_MUTEX_INITIALIZER;
++static u64 monotonic_ns(void);
++
++static u8 *stack_take(size_t size) {
++    u64 now = monotonic_ns();
++    pthread_mutex_lock(&spare_lock);
++    for (int i = 0; i < nspare_stacks; i++)
++        if (spare_stacks[i].size == size && now - spare_stacks[i].since > 200000000ull) {
++            u8 *base = spare_stacks[i].base;
++            spare_stacks[i] = spare_stacks[--nspare_stacks];
++            pthread_mutex_unlock(&spare_lock);
++            return base;
++        }
++    pthread_mutex_unlock(&spare_lock);
++    return rt_ps4_stack(size, 1u << 20);
++}
++
++static void stack_give(u8 *base, size_t size) {
++    pthread_mutex_lock(&spare_lock);
++    if (nspare_stacks < SPARE_STACKS) {
++        spare_stacks[nspare_stacks].base = base;
++        spare_stacks[nspare_stacks].size = size;
++        spare_stacks[nspare_stacks].since = monotonic_ns();
++        nspare_stacks++;
++    }
++    pthread_mutex_unlock(&spare_lock);
++}
 +#endif
 +
  static void *thread_start(void *arg) {
      Obj *o = arg;
      o->tid = self_tid();
-@@ -461,7 +483,16 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
+     rt_thread_signal_stack();
+     DWORD code = o->fn(o->param);
+     (void)code;
++#ifdef __ORBIS__
++    if (o->stack_base) stack_give(o->stack_base, o->stack_size);
++#endif
+     forget_description(o->tid);
+     obj_signal(o);
+     obj_release(o);   /* (the thread's own reference) */
+@@ -461,7 +528,16 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
      pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
      if (!stack) stack = 8u << 20;
      stack = (stack + 0xFFFF) & ~(SIZE_T)0xFFFF;
@@ -303,8 +367,8 @@ index b56617b..382ccbf 100644
 +    /* The PS4's thread stacks are flexible memory, a few hundred MiB in all: from the lazy host
 +     * range instead (direct memory, mapped as touched; its top 1 MiB at once: system calls with
 +     * buffers on the stack cannot fault pages in). The stack stays when the thread ends. */
-+    u8 *base = rt_ps4_stack(stack, 1u << 20);
-+    if (base) pthread_attr_setstack(&a, base + 0x10000, stack);
++    u8 *base = stack_take(stack);
++    if (base) { pthread_attr_setstack(&a, base + 0x10000, stack); o->stack_base = base; o->stack_size = stack; }
 +    else pthread_attr_setstacksize(&a, 2u << 20);
 +#else
      pthread_attr_setstacksize(&a, stack);
@@ -312,7 +376,7 @@ index b56617b..382ccbf 100644
  #ifdef __APPLE__
      /* The game's threads (the guest's, the renderer, audio, input) keep pace with frames: on
       * Apple silicon a thread's class decides between the performance and efficiency cores.
-@@ -549,7 +580,11 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
+@@ -549,7 +625,11 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
      set_description(tid, text);
      char shortname[16];
      snprintf(shortname, sizeof shortname, "%s", text);
@@ -324,7 +388,7 @@ index b56617b..382ccbf 100644
      return S_OK;
  }
  
-@@ -557,7 +592,11 @@ BOOL SetThreadPriority(HANDLE thread, int priority) {
+@@ -557,7 +637,11 @@ BOOL SetThreadPriority(HANDLE thread, int priority) {
      RtTid tid = thread == PSEUDO_THREAD ? self_tid() : rt_thread_tid(thread);
      if (!tid) return FALSE;
      int nice = priority <= THREAD_PRIORITY_LOWEST ? 5 : priority == THREAD_PRIORITY_BELOW_NORMAL ? 2 : 0;
@@ -336,7 +400,7 @@ index b56617b..382ccbf 100644
      return TRUE;
  }
  #endif
-@@ -650,9 +689,14 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
+@@ -650,9 +734,14 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
      (void)flags;
      size_t size = reserve ? reserve : commit ? commit : (1u << 20);
      size = (size + 0xFFFF) & ~(size_t)0xFFFF;
@@ -351,7 +415,7 @@ index b56617b..382ccbf 100644
      Fiber *f = calloc(1, sizeof *f);
      f->fn = fn;
      f->param = param;
-@@ -685,7 +729,11 @@ void SwitchToFiber(LPVOID fiber) {
+@@ -685,7 +774,11 @@ void SwitchToFiber(LPVOID fiber) {
  void DeleteFiber(LPVOID fiber) {
      Fiber *f = fiber;
      if (!f || f == current_fiber) return;
@@ -363,7 +427,7 @@ index b56617b..382ccbf 100644
      free(f);
  }
  BOOL IsThreadAFiber(void) { return current_fiber != NULL; }
-@@ -758,7 +806,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
+@@ -758,7 +851,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
  }
  
  /* ---- memory ------------------------------------------------------------------------------- */
@@ -372,7 +436,7 @@ index b56617b..382ccbf 100644
  #define PAGE 4096ull
  static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
  typedef struct Reservation { u64 base, size; int watch; } Reservation;
-@@ -899,7 +947,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
+@@ -899,7 +992,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
  }
  
  /* ---- the write watch ---------------------------------------------------------------------- */
@@ -381,7 +445,7 @@ index b56617b..382ccbf 100644
  #ifndef UFFD_USER_MODE_ONLY
  #define UFFD_USER_MODE_ONLY 1
  #endif
-@@ -1157,8 +1205,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
+@@ -1157,8 +1250,8 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
      return o;
  }
  
@@ -392,7 +456,7 @@ index b56617b..382ccbf 100644
  
  /* The read through a host buffer, a megabyte at a time, copied into buf by stores: a store to a
   * protected page faults, and the fault handler lets it through (rt_ww_fault), however often the
-@@ -1190,7 +1238,7 @@ static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int posit
+@@ -1190,7 +1283,7 @@ static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int posit
   * having filled the pages before (read() moving the file offset on by those) - so the read goes
   * back to where it started and through a host buffer. */
  static ssize_t read_some(int fd, void *buf, size_t n, off_t offset, int positional) {
@@ -401,7 +465,7 @@ index b56617b..382ccbf 100644
      off_t start = positional ? offset : lseek(fd, 0, SEEK_CUR);
      ssize_t r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
      if (r >= 0 || errno != EFAULT) return r;
-@@ -1384,6 +1432,8 @@ errno_t rand_s(unsigned int *value) {
+@@ -1384,6 +1477,8 @@ errno_t rand_s(unsigned int *value) {
  #ifdef __APPLE__
      arc4random_buf(value, sizeof *value);
      return 0;
@@ -410,7 +474,7 @@ index b56617b..382ccbf 100644
  #else
      return getrandom(value, sizeof *value, 0) == (ssize_t)sizeof *value ? 0 : EIO;
  #endif
-@@ -1397,6 +1447,10 @@ void ExitProcess(UINT code) {
+@@ -1397,6 +1492,10 @@ void ExitProcess(UINT code) {
  #ifdef __APPLE__   /* (the program's Mach-O header: where it is loaded) */
  HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
  HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
@@ -728,10 +792,10 @@ index 0000000..267d2cd
 +#endif
 diff --git a/runtime/ps4/memory.c b/runtime/ps4/memory.c
 new file mode 100644
-index 0000000..d6e25f2
+index 0000000..b55da92
 --- /dev/null
 +++ b/runtime/ps4/memory.c
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,660 @@
 +/* Memory for the PS4 build of the Windows API (runtime/linux/include/windows.h): VirtualAlloc and
 + * the rest, and the write watch - what runtime/linux/win32.c does on Linux and runtime/macos/
 + * memory.c on macOS, for a system with no demand-zero memory to speak of (the SMW port's design,
@@ -748,8 +812,9 @@ index 0000000..d6e25f2
 + * blocks (smaller pieces when it is fragmented) and handed out by chunk.
 + *
 + * Reservations with no address of their own (VirtualAlloc(NULL, ...): thread stacks, the
-+ * runtime's copies of module code, the NROs' code) come from a host range of 16 GiB,
-+ * [0x5000000000, 0x5400000000): between RADV's GPU windows ([0x4000000000, 0x4500000000), the PS4
++ * runtime's copies of module code, the NROs' code) come from a host range of 104 GiB - every guest
++ * thread's stack reserves 256 MiB (16 GiB ran out in v00.07) - [0x4600000000, 0x6000000000): between
++ * RADV's GPU windows ([0x4000000000, 0x4500000000), the PS4
 + * winsys's) and the guest's lowest range (the alias area at 0x6000000000; host.h: the guest's go up
 + * to 0x7800000000 and beyond, its shared fonts there - v00.06's host range at 0x7800000000 took it).
 + *
@@ -793,8 +858,8 @@ index 0000000..d6e25f2
 +#define PROT_RW 0x3
 +#define WB_ONION 0
 +
-+#define HOST_BASE 0x5000000000ull
-+#define HOST_END 0x5400000000ull
++#define HOST_BASE 0x4600000000ull
++#define HOST_END 0x6000000000ull
 +#define MAX_AREAS 1024
 +#define MAX_FREE (1u << 17)   /* freed chunks kept for reuse (8 GiB worth) */
 +

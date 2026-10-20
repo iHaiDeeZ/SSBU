@@ -3,6 +3,7 @@
 // where the Vulkan WSI's lines go, and the crash log's guest part.
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
 
 #include "../port/ps4_vk_wsi.h"
 
@@ -30,6 +31,9 @@ extern "C" void ps4_port_start() {
     setenv("DXVK_LOG_PATH", "/data/SSBU", 1);
     setenv("DXVK_LOG_LEVEL", "info", 0);
     setenv("DXVK_CONFIG_FILE", "/data/SSBU/dxvk.conf", 1);
+    // its pipeline cache kept between runs (the first time each effect is drawn its pipeline is compiled: a hitch)
+    mkdir("/data/SSBU/dxvk", 0777);
+    setenv("DXVK_SHADER_CACHE_PATH", "/data/SSBU/dxvk", 1);
     if (std::FILE* conf = std::fopen("/data/SSBU/dxvk.conf", "r")) {
         std::fclose(conf);
     } else if ((conf = std::fopen("/data/SSBU/dxvk.conf", "w"))) {
