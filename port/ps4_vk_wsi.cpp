@@ -37,6 +37,7 @@ extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(Vk
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char* name);
 // port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip)
 extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
+extern "C" void ps4_boot_trace(const char* stage);  // port/ps4_crashlog.cpp
 
 namespace ssbu::ps4 {
 
@@ -82,6 +83,20 @@ void log(const char* fmt, ...) {
     wsi_log(line);
 }
 
+// Step trace: one direct write per line to boot-trace.log (port/ps4_crashlog.cpp), so the last line before a crash
+// that leaves no crash.log (the system ending the app) says which call it was. The first frames only.
+std::atomic<int> g_steps{0};
+constexpr int kMaxSteps = 400;
+void step(const char* fmt, ...) {
+    if (g_steps.fetch_add(1) >= kMaxSteps) return;
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    ps4_boot_trace(line);
+}
+
 template <typename T>
 T device_fn(VkDevice device, const char* name) {
     return reinterpret_cast<T>(vk_common_GetDeviceProcAddr(device, name));
@@ -92,16 +107,24 @@ T instance_fn(const char* name) {
     return reinterpret_cast<T>(vk_icdGetInstanceProcAddr(g_instance, name));
 }
 
+std::mutex g_video_lock;
+
 bool open_video_out() {
+    std::lock_guard lk(g_video_lock);
     if (g_video >= 0) return true;
-    g_video = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, ORBIS_VIDEO_OUT_BUS_MAIN, 0, nullptr);
+    step("wsi: sceVideoOutOpen");
+    g_video = sceVideoOutOpen(0xFF, 0, 0, nullptr);  // (the main user, the main bus: as SMW)
+    step("wsi: sceVideoOutOpen = %x", unsigned(g_video));
     if (g_video < 0) {
         log("ps4/wsi: sceVideoOutOpen failed: %x", unsigned(g_video));
         return false;
     }
-    if (sceKernelCreateEqueue(&g_flip_queue, "ssbu flip") < 0 ||
-        sceVideoOutAddFlipEvent(g_flip_queue, g_video, nullptr) < 0) {
-        log("ps4/wsi: no flip event queue");
+    int r = sceKernelCreateEqueue(&g_flip_queue, "ssbu flip");
+    step("wsi: sceKernelCreateEqueue = %x", unsigned(r));
+    if (r >= 0) r = sceVideoOutAddFlipEvent(g_flip_queue, g_video, nullptr);
+    step("wsi: sceVideoOutAddFlipEvent = %x", unsigned(r));
+    if (r < 0) {
+        log("ps4/wsi: no flip event queue (%x)", unsigned(r));
         g_flip_queue = 0;
     }
     return true;
@@ -281,6 +304,9 @@ void free_swapchain(Swapchain* sc) {
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                   const VkAllocationCallbacks*, VkSwapchainKHR* swapchain) {
+    step("wsi: CreateSwapchainKHR %u images %ux%u format %d mode %d usage %#x", info->minImageCount,
+         info->imageExtent.width, info->imageExtent.height, int(info->imageFormat), int(info->presentMode),
+         unsigned(info->imageUsage));
     std::lock_guard lk(g_lock);
     if (!open_video_out()) return VK_ERROR_INITIALIZATION_FAILED;
     auto sc = new Swapchain();
@@ -308,7 +334,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
         ici.tiling = VK_IMAGE_TILING_LINEAR;
         ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        step("wsi: image %u: vkCreateImage", k);
         VkResult r = create_image(device, &ici, nullptr, &sc->images[k]);
+        step("wsi: image %u: vkCreateImage = %d", k, int(r));
         if (r != VK_SUCCESS) {
             log("ps4/wsi: vkCreateImage failed: %d", int(r));
             free_swapchain(sc);
@@ -320,9 +348,17 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = req.size + kFramebufferAlign;
         mai.memoryTypeIndex = host_visible_type(req.memoryTypeBits);
+        step("wsi: image %u: %llu bytes, align %llu, types %#x -> type %u", k, (unsigned long long)req.size,
+             (unsigned long long)req.alignment, req.memoryTypeBits, mai.memoryTypeIndex);
+        if (mai.memoryTypeIndex == UINT32_MAX) {
+            log("ps4/wsi: no device-local host-visible memory type for the swapchain (types %#x)", req.memoryTypeBits);
+            free_swapchain(sc);
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
         uint8_t* base = nullptr;
         r = allocate(device, &mai, nullptr, &sc->memory[k]);
         if (r == VK_SUCCESS) r = map(device, sc->memory[k], 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&base));
+        step("wsi: image %u: memory %d at %p", k, int(r), static_cast<void*>(base));
         if (r != VK_SUCCESS) {
             log("ps4/wsi: swapchain memory failed: %d", int(r));
             free_swapchain(sc);
@@ -345,8 +381,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
     // Two buffer index ranges in turn, so a new swapchain can register while the old one is still on screen.
     sc->first_buffer = g_next_first_buffer;
     g_next_first_buffer = g_next_first_buffer == 0 ? 8 : 0;
+    step("wsi: sceVideoOutRegisterBuffers %u buffers from %d, pitch %u", sc->image_count, sc->first_buffer, pitch);
     sc->buffer_set =
         sceVideoOutRegisterBuffers(g_video, sc->first_buffer, addresses, int(sc->image_count), &attribute);
+    step("wsi: sceVideoOutRegisterBuffers = %x", unsigned(sc->buffer_set));
     if (sc->buffer_set < 0) {
         log("ps4/wsi: sceVideoOutRegisterBuffers failed: %x", unsigned(sc->buffer_set));
         free_swapchain(sc);
@@ -439,9 +477,11 @@ VkQueue graphics_queue(VkDevice device) {
 VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t, VkSemaphore,
                                                    VkFence fence, uint32_t* index) {
     auto sc = reinterpret_cast<Swapchain*>(swapchain);
+    step("wsi: AcquireNextImageKHR (fence %d)", fence ? 1 : 0);
     wait_off_screen(sc->image_count);
     *index = sc->next_image;
     sc->next_image = (sc->next_image + 1) % sc->image_count;
+    step("wsi: acquired image %u", *index);
     // The image is free now. The semaphore is never signalled (see the top of the file); a fence, if asked for, is
     // signalled by an empty submit.
     if (fence) {
@@ -465,11 +505,14 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         const uint32_t buffer = uint32_t(sc->first_buffer) + info->pImageIndices[k];
         const int64_t arg = int64_t(g_flips.load() + 1);
         // the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or the vblank
+        step("wsi: QueuePresentKHR image %u -> buffer %u, flip %lld", info->pImageIndices[k], buffer, (long long)arg);
         int r = ac_ps4_submit_flip(g_video, buffer, sc->flip_mode, arg);
+        step("wsi: ac_ps4_submit_flip = %x", unsigned(r));
         const bool gpu_flip = r == 0;
         if (!gpu_flip) {  // fallback: wait for the GPU on the CPU, then flip
             device_fn<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
             r = sceVideoOutSubmitFlip(g_video, int(buffer), sc->flip_mode, arg);
+            step("wsi: sceVideoOutSubmitFlip = %x", unsigned(r));
         }
         if (r < 0) {
             log("ps4/wsi: flip failed: %x", unsigned(r));
@@ -556,8 +599,13 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t count, const 
             tl[k].pNext = nullptr;
             copy[k].pNext = &tl[k];
         }
+        step("wsi: QueueSubmit [%u] %u command buffers, waits %u of %u kept, signals %u of %u kept, fence %d", k,
+             submits[k].commandBufferCount, copy[k].waitSemaphoreCount, submits[k].waitSemaphoreCount,
+             copy[k].signalSemaphoreCount, submits[k].signalSemaphoreCount, fence ? 1 : 0);
     }
-    return real(queue, count, copy.data(), fence);
+    VkResult r = real(queue, count, copy.data(), fence);
+    step("wsi: QueueSubmit = %d", int(r));
+    return r;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2* submits,
@@ -577,8 +625,13 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit2(VkQueue queue, uint32_t count, const
         copy[k].pWaitSemaphoreInfos = sems[2 * k].data();
         copy[k].signalSemaphoreInfoCount = uint32_t(sems[2 * k + 1].size());
         copy[k].pSignalSemaphoreInfos = sems[2 * k + 1].data();
+        step("wsi: QueueSubmit2 [%u] %u command buffers, waits %u of %u kept, signals %u of %u kept, fence %d", k,
+             submits[k].commandBufferInfoCount, copy[k].waitSemaphoreInfoCount, submits[k].waitSemaphoreInfoCount,
+             copy[k].signalSemaphoreInfoCount, submits[k].signalSemaphoreInfoCount, fence ? 1 : 0);
     }
-    return real(queue, count, copy.data(), fence);
+    VkResult r = real(queue, count, copy.data(), fence);
+    step("wsi: QueueSubmit2 = %d", int(r));
+    return r;
 }
 
 PFN_vkVoidFunction intercept(const char* name) {
@@ -634,6 +687,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance
 void* vk_get_instance_proc_addr() { return reinterpret_cast<void*>(&GetInstanceProcAddr); }
 
 uint64_t vk_flips() { return g_flips.load(); }
+
+bool video_out_open() { return open_video_out(); }
 
 }  // namespace ssbu::ps4
 

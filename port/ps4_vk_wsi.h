@@ -16,6 +16,10 @@ void* vk_get_instance_proc_addr();
 // Flips submitted so far (the first one hides the system's splash screen).
 uint64_t vk_flips();
 
+// Opens VideoOut and its flip event queue (once; the swapchain does it too). Call it early on the main thread, as SMW's
+// boot screen does.
+bool video_out_open();
+
 // Where the WSI's lines go (defined by the app).
 void wsi_log(const char* line);
 
