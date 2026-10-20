@@ -76,6 +76,38 @@ index 9e3a126..5433fc6 100644
  }
    
  extern "C" {
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index e50d360..8e2f961 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -343,6 +343,14 @@ namespace dxvk {
+       return S_OK;
+     }
+ 
++#ifdef DXVK_PS4
++    // PS4 (SSBU port): made without the lock - the game creates shaders on several threads of its
++    // own, and with the lock held through each one's translation and pipeline library compile
++    // (seconds, on this CPU) they took turns, the others waiting. Two threads making the same
++    // shader at once is rare: the first one's goes in, the other's is dropped.
++    lock.unlock();
++#endif
++
+     D3D11CommonShader module;
+ 
+     try {
+@@ -353,6 +361,12 @@ namespace dxvk {
+       return E_INVALIDARG;
+     }
+ 
++#ifdef DXVK_PS4
++    lock.lock();
++    auto made = m_modules.insert({ ShaderKey, module });
++    *pShader = made.first->second;
++    return S_OK;
++#endif
+     m_modules.insert({ ShaderKey, module });
+     *pShader = std::move(module);
+     return S_OK;
 diff --git a/src/d3d11/meson.build b/src/d3d11/meson.build
 index af2b7b2..d9feed7 100644
 --- a/src/d3d11/meson.build

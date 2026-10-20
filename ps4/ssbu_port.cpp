@@ -3,6 +3,7 @@
 // where the Vulkan WSI's lines go, and the crash log's guest part.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sys/stat.h>
 
 #include "../port/ps4_vk_wsi.h"
@@ -25,6 +26,21 @@ extern "C" void ps4_port_start() {
     for (char* c = version; *c; c++)
         if (*c == '\n' || *c == '\r') *c = 0;
     std::fprintf(stderr, "[boot] SSBU %s for PS4 (WindowSmash runtime, DXVK on RADV)\n", version);
+    // /data/SSBU/env.txt: NAME=value lines (# comments) set before anything reads them - the
+    // runtime's switches (SSBU_*, DXVK_*) for a test run, changed over FTP without a new package
+    if (std::FILE* env = std::fopen("/data/SSBU/env.txt", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof line, env)) {
+            line[std::strcspn(line, "\r\n")] = 0;
+            char* eq = std::strchr(line, '=');
+            if (line[0] == '#' || !eq || eq == line)
+                continue;
+            *eq = 0;
+            setenv(line, eq + 1, 1);
+            std::fprintf(stderr, "[boot] env.txt: %s=%s\n", line, eq + 1);
+        }
+        std::fclose(env);
+    }
     char line[64];
     std::snprintf(line, sizeof line, "SSBU %s starting", version);
     ps4_boot_trace(line);
@@ -45,6 +61,10 @@ extern "C" void ps4_port_start() {
     // through QueryPerformanceCounter and clock_gettime: v00.09's profile had the guest main thread
     // spend a tenth of its time in those
     setenv("SSBU_CLOCK", "tsc", 0);
+    // three shader compiler threads (the runtime's default here would be two: a third of the cores):
+    // the game itself keeps one core busy and a little of two more, and a match's first draws wait
+    // on hundreds of shaders
+    setenv("SSBU_COMPILE_THREADS", "3", 0);
     ps4_profile_thread_begin();   // (the main thread: the others from their start)
     if (std::FILE* conf = std::fopen("/data/SSBU/dxvk.conf", "r")) {
         std::fclose(conf);
