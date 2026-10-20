@@ -62,8 +62,22 @@ index 98851af..46faaee 100644
  option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')
  option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SDL2 WSI for DXVK Native')
  option('native_sdl3',  type : 'feature', value : 'auto', description: 'Enable SDL3 WSI for DXVK Native')
+diff --git a/src/d3d11/d3d11_main.cpp b/src/d3d11/d3d11_main.cpp
+index 9e3a126..5433fc6 100644
+--- a/src/d3d11/d3d11_main.cpp
++++ b/src/d3d11/d3d11_main.cpp
+@@ -9,7 +9,9 @@
+ #include "d3d11_interop.h"
+ 
+ namespace dxvk {
++#ifndef DXVK_PS4  // (PS4: one static link, the logger is dxgi_main.cpp's)
+   Logger Logger::s_instance("d3d11.log");
++#endif
+ }
+   
+ extern "C" {
 diff --git a/src/d3d11/meson.build b/src/d3d11/meson.build
-index af2b7b2..6eb4356 100644
+index af2b7b2..d9feed7 100644
 --- a/src/d3d11/meson.build
 +++ b/src/d3d11/meson.build
 @@ -79,23 +79,32 @@ else
@@ -82,7 +96,7 @@ index af2b7b2..6eb4356 100644
 -)
 +if dxvk_ps4
 +  # PS4 (SSBU port): a static archive linked into the eboot
-+  d3d11_dll = static_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src + d3d10_src,
++  d3d11_dll = static_library(dxvk_name_prefix+'d3d11', d3d11_src + d3d10_src,
 +    glsl_generator.process(d3d11_shaders),
 +    dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
 +    include_directories : dxvk_include_path,
@@ -110,6 +124,22 @@ index af2b7b2..6eb4356 100644
    pkg.generate(d3d11_dll,
      filebase: dxvk_pkg_prefix + 'd3d11',
      subdirs:  'dxvk',
+diff --git a/src/dxgi/dxgi_main.cpp b/src/dxgi/dxgi_main.cpp
+index 158a3c0..ce9333d 100644
+--- a/src/dxgi/dxgi_main.cpp
++++ b/src/dxgi/dxgi_main.cpp
+@@ -3,7 +3,11 @@
+ 
+ namespace dxvk {
+   
++#ifdef DXVK_PS4
++  Logger Logger::s_instance("dxvk.log");
++#else
+   Logger Logger::s_instance("dxgi.log");
++#endif
+   
+   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
+     try {
 diff --git a/src/dxgi/meson.build b/src/dxgi/meson.build
 index a9ed5e7..420fa6a 100644
 --- a/src/dxgi/meson.build
