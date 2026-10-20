@@ -1,4 +1,13 @@
-out/
 *.pkg
+*.elf
 *.oelf
+out/
+build/
+*.tar
+# the game: never in this repository (dumps, keys, generated code, staged data)
+*.xci
+*.nsp
+*.keys
+private/
 modules/
+dump/
