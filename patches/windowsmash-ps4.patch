@@ -204,7 +204,7 @@ index e822de7..e498d1a 100644
      HMODULE m = LoadLibraryA("xinput1_4.dll");
      if (!m) m = LoadLibraryA("xinput9_1_0.dll");
 diff --git a/runtime/host.c b/runtime/host.c
-index ac98629..30ab711 100644
+index ac98629..2346285 100644
 --- a/runtime/host.c
 +++ b/runtime/host.c
 @@ -411,8 +411,18 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
@@ -226,7 +226,7 @@ index ac98629..30ab711 100644
      Dl_info di;
      if (dladdr(pc, &di) && di.dli_fname) {
          const char *base = strrchr(di.dli_fname, '/');
-@@ -459,45 +469,169 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+@@ -459,45 +469,195 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
  }
  #else
  /* Another thread's frames: it is interrupted and records its own stack. */
@@ -350,6 +350,45 @@ index ac98629..30ab711 100644
 +    out("  %016llx: %s\n", at, hex);
 +}
 +
++/* The guest's registers as its code last stored them (stored before every call: in a function
++ * that called abort, its values at that call) and its own frame records. */
++static void guest_state(const Cpu *c) {
++    char name[96];
++    out("guest registers (as its code last stored them):\n");
++    for (int i = 0; i < 31; i += 4) {
++        char text[160];
++        size_t len = 0;
++        for (int k = i; k < i + 4 && k < 31; k++) len += (size_t)snprintf(text + len, sizeof text - len, "  x%-2d %016llx", k, c->x[k]);
++        out("%s\n", text);
++    }
++    out("  sp  %016llx\n", c->sp);
++    u64 ras[32];
++    int n = guest_walk(c, ras, 32);
++    out("guest frame records (return addresses, innermost first):\n");
++    for (int i = 0; i < n; i++) out("  %s\n", rt_describe(ras[i], name, sizeof name));
++}
++
++/* What a stop (rt_fatal: a guest abort, an svcBreak) leaves for the PS4's reports besides its frames:
++ * the guest's registers and frame records, its stack (its callers' saved registers among it), the
++ * memory the registers point at, the kernel's last memory calls, and every guest thread's stack. */
++static void stopped_details(void) {
++    const Cpu *c = rt_cpu_current;
++    if (c) {
++        guest_state(c);
++        out("guest stack from sp:\n");
++        u64 base = c->sp & ~15ull;
++        for (u64 at = base; at < base + 0x200 && rt_readable(G2H(at), 32); at += 32)
++            out("  +%03llx  %016llx %016llx %016llx %016llx\n", at - base, ld64(at), ld64(at + 8), ld64(at + 16), ld64(at + 24));
++        out("memory the guest registers point at:\n");
++        u64 seen[24];
++        int nseen = 0;
++        for (int i = 0; i < 31; i++) dump_at(c->x[i], seen, &nseen);
++    }
++    kernel_memory_calls(out_line);
++    out("every guest thread:\n");
++    kernel_thread_stacks(out_line);
++}
++
 +/* What else a fault leaves for the PS4's reports (no debugger, no core dump to read): the host
 + * registers; the guest's as its code last stored them, and its own frame records; the faulting
 + * frame's stack, its callers' saved registers among it; and the memory those values point at. */
@@ -360,26 +399,13 @@ index ac98629..30ab711 100644
 +    const u64 regs[16] = {(u64)m->mc_rax, (u64)m->mc_rbx, (u64)m->mc_rcx, (u64)m->mc_rdx, (u64)m->mc_rsi, (u64)m->mc_rdi,
 +                          (u64)m->mc_rbp, (u64)m->mc_rsp, (u64)m->mc_r8, (u64)m->mc_r9, (u64)m->mc_r10, (u64)m->mc_r11,
 +                          (u64)m->mc_r12, (u64)m->mc_r13, (u64)m->mc_r14, (u64)m->mc_r15};
-+    char name[96];
 +    out("host registers (the eboot's code at %p: an address minus that is its ELF address):\n", (void *)__text_start);
 +    for (int i = 0; i < 16; i += 4)
 +        out("  %-3s %016llx  %-3s %016llx  %-3s %016llx  %-3s %016llx\n", names[i], regs[i], names[i + 1], regs[i + 1],
 +            names[i + 2], regs[i + 2], names[i + 3], regs[i + 3]);
 +    const Cpu *c = rt_cpu_current;
-+    if (c) {
-+        out("guest registers (as its code last stored them):\n");
-+        for (int i = 0; i < 31; i += 4) {
-+            char text[160];
-+            size_t len = 0;
-+            for (int k = i; k < i + 4 && k < 31; k++) len += (size_t)snprintf(text + len, sizeof text - len, "  x%-2d %016llx", k, c->x[k]);
-+            out("%s\n", text);
-+        }
-+        out("  sp  %016llx\n", c->sp);
-+        u64 ras[32];
-+        int n = guest_walk(c, ras, 32);
-+        out("guest frame records (return addresses, innermost first):\n");
-+        for (int i = 0; i < n; i++) out("  %s\n", rt_describe(ras[i], name, sizeof name));
-+    }
++    if (c) guest_state(c);
++    kernel_memory_calls(out_line);
 +    out("host stack from rsp:\n");
 +    u64 words[64], base = (u64)m->mc_rsp & ~7ull;
 +    int nwords = 0;
@@ -400,7 +426,7 @@ index ac98629..30ab711 100644
  /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
   * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
   * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
-@@ -513,6 +647,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -513,6 +673,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      static volatile RtTid reporter;
      RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
      (void)si;
@@ -415,7 +441,7 @@ index ac98629..30ab711 100644
  #else
      int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
      if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
-@@ -530,6 +672,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -530,6 +698,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
  #ifdef __APPLE__
      u64 sp = uc->uc_mcontext->__ss.__sp;
      int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
@@ -425,7 +451,7 @@ index ac98629..30ab711 100644
  #else
      u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
      int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
-@@ -551,6 +696,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -551,6 +722,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      void *frames[64];
  #ifdef __APPLE__   /* (from the faulting context: a leaf function's caller is in the link register) */
      int n = walk_frames(pc, uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ss.__fp, frames, 64), from = 0;
@@ -434,7 +460,7 @@ index ac98629..30ab711 100644
  #else
      int n = backtrace(frames, 64), from = 0;
      for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
-@@ -558,6 +705,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -558,6 +731,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
      gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
      print_frames(frames + from, n - from);
@@ -444,7 +470,17 @@ index ac98629..30ab711 100644
      report_close(report);
      fflush(stderr);
      _exit(5);
-@@ -906,6 +1056,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
+@@ -603,6 +779,9 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
+     report_open("stopped", report, sizeof report);
+     out("\n*** stopped during %s: %s\n", phase, text);
+     rt_backtrace();
++#ifdef __ORBIS__
++    stopped_details();
++#endif
+     report_close(report);
+     fflush(stderr);
+     ExitProcess(3);
+@@ -906,6 +1085,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
      const RtModule *mod = NULL;
      for (u32 k = 0; k < rt_nro_count && !mod; k++)
          if (!strcmp(rt_nro_modules[k]->build_id, id)) mod = rt_nro_modules[k];
@@ -459,7 +495,7 @@ index ac98629..30ab711 100644
      if (!mod || module_count == MAX_MODULES) { ReleaseSRWLockExclusive(&lock); return 0; }
      u32 m = module_count;
      modules[m] = mod;
-@@ -1075,6 +1233,10 @@ int main(int argc, char **argv) {
+@@ -1075,6 +1262,10 @@ int main(int argc, char **argv) {
  #endif
  #ifdef __APPLE__
      mac_start(argc, argv, &dir, &options);
@@ -471,16 +507,17 @@ index ac98629..30ab711 100644
      if (!dir) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
      display_dpi_aware();
 diff --git a/runtime/host.h b/runtime/host.h
-index 5cdc854..3cd4070 100644
+index 5cdc854..c864548 100644
 --- a/runtime/host.h
 +++ b/runtime/host.h
-@@ -51,7 +51,9 @@ u64 rt_symbol(const char *name);                       /* guest address of an ex
+@@ -51,7 +51,10 @@ u64 rt_symbol(const char *name);                       /* guest address of an ex
  const char *rt_describe(u64 guest_addr, char *buf, size_t n);   /* "module+0x1234" */
  void rt_backtrace(void);
  void rt_backtrace_thread(HANDLE thread, int max_frames);   /* another thread's guest frames */
 +void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text));   /* (Linux, the PS4) */
  void kernel_dump_threads(void);
 +void kernel_thread_stacks(void (*line)(const char *text));   /* (the PS4: every guest thread's, for a freeze report) */
++void kernel_memory_calls(void (*line)(const char *text));    /* (the PS4: the last heap, mapping and physical memory calls) */
  _Noreturn void rt_fatal(const char *fmt, ...);         /* message + guest backtrace, then exit */
  extern int rt_trace;
  extern const char *rt_data_dir;                        /* where the module images (and romfs.cfg) live */
@@ -552,10 +589,10 @@ index e1a7bdf..a3a5fff 100644
      SDL_AudioSpec want, got;
      memset(&want, 0, sizeof want);
 diff --git a/runtime/kernel.c b/runtime/kernel.c
-index 029ed2f..a84b86a 100644
+index 029ed2f..0351d25 100644
 --- a/runtime/kernel.c
 +++ b/runtime/kernel.c
-@@ -207,6 +207,11 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32
+@@ -207,6 +207,42 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32
   * which on macOS leaves the signal mask alone - nothing changes it on a guest thread.) */
  static __thread jmp_buf *exit_point;
  #endif
@@ -563,11 +600,42 @@ index 029ed2f..a84b86a 100644
 +/* The PS4: the guest thread's state, for the crash and freeze reports (host.c: its registers as
 + * its code last stored them, and the guest's own frame records from there). */
 +__thread Cpu *rt_cpu_current;
++
++/* And the last memory calls (the heap, mappings, physical memory), for the stop and crash reports:
++ * what the guest had asked of the kernel before an abort over its memory (v00.16: FreeMemoryPages
++ * refused a range, the game stopped). Written under the kernel's lock, read without it. */
++static struct MemoryCall { u64 when, addr, src, size; u32 svc, thread; } memory_calls[64];
++static u32 memory_call_count;
++
++static void note_memory_call(u32 svc, const KThread *t, u64 addr, u64 src, u64 size) {
++    memory_calls[memory_call_count % 64] = (struct MemoryCall){now_ns(), addr, src, size, svc, t ? (u32)t->id : 0};
++    memory_call_count++;
++}
++
++void kernel_memory_calls(void (*line)(const char *text)) {
++    char text[160];
++    u32 n = memory_call_count, first = n > 64 ? n - 64 : 0;
++    snprintf(text, sizeof text, "the kernel's last memory calls (%u in all; now %.3f s):\n", n, now_ns() / 1e9);
++    line(text);
++    for (u32 i = first; i < n; i++) {
++        const struct MemoryCall *m = &memory_calls[i % 64];
++        const char *what = m->svc == 0x01 ? "SetHeapSize" : m->svc == 0x04 ? "MapMemory" : m->svc == 0x05 ? "UnmapMemory" :
++                           m->svc == 0x2C ? "MapPhysicalMemory" : "UnmapPhysicalMemory";
++        if (m->svc == 0x04 || m->svc == 0x05)
++            snprintf(text, sizeof text, "  %9.3f s  thread %-3u %-19s %#llx + %#llx (from %#llx)\n", m->when / 1e9, m->thread, what, m->addr, m->size, m->src);
++        else
++            snprintf(text, sizeof text, "  %9.3f s  thread %-3u %-19s %#llx + %#llx\n", m->when / 1e9, m->thread, what, m->addr, m->size);
++        line(text);
++    }
++}
++#define NOTE_MEMORY_CALL(svc, addr, src, size) note_memory_call(svc, me, addr, src, size)
++#else
++#define NOTE_MEMORY_CALL(svc, addr, src, size) ((void)0)
 +#endif
  
  static _Noreturn void exit_thread(KThread *t) {
      EnterCriticalSection(&klock);
-@@ -235,6 +240,9 @@ static DWORD WINAPI thread_main(LPVOID param) {
+@@ -235,6 +271,9 @@ static DWORD WINAPI thread_main(LPVOID param) {
      jmp_buf out;
      exit_point = &out;
      if (RT_SETJMP(out)) return 0;
@@ -577,7 +645,7 @@ index 029ed2f..a84b86a 100644
  #endif
      rt_call(t->cpu, t->entry);
      exit_thread(t);
-@@ -250,6 +258,9 @@ Cpu *kernel_main_thread(u32 *handle) {
+@@ -250,6 +289,9 @@ Cpu *kernel_main_thread(u32 *handle) {
      DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host, 0, FALSE, DUPLICATE_SAME_ACCESS);
      LeaveCriticalSection(&klock);
      *handle = t->handle;
@@ -587,7 +655,45 @@ index 029ed2f..a84b86a 100644
      return t->cpu;
  }
  
-@@ -648,6 +659,27 @@ void kernel_dump_threads(void) {
+@@ -462,6 +504,7 @@ void rt_svc(Cpu *c, u32 n) {
+     switch (n) {
+     case 0x01: {   /* SetHeapSize(size) -> address */
+         u64 size = x[1];
++        NOTE_MEMORY_CALL(0x01, HEAP_BASE, 0, size);
+         if (size > HEAP_LIMIT) { x[0] = R_OUT_OF_MEMORY; break; }
+         if (size > heap_size) commit(HEAP_BASE + heap_size, size - heap_size, "the heap");
+         if (heap_size) remove_region(HEAP_BASE);
+@@ -473,6 +516,7 @@ void rt_svc(Cpu *c, u32 n) {
+     case 0x02: case 0x03: x[0] = R_OK; break;            /* SetMemoryPermission / SetMemoryAttribute */
+     case 0x04: {   /* MapMemory(dst, src, size): the pages appear at dst; here, as a copy */
+         u32 i = 0;
++        NOTE_MEMORY_CALL(0x04, x[0], x[1], x[2]);
+         while (i < 1024 && maps[i].size) i++;
+         if (i == 1024) rt_fatal("kernel: too many memory mappings");
+         commit(x[0], x[2], "a memory mapping");
+@@ -483,6 +527,7 @@ void rt_svc(Cpu *c, u32 n) {
+         break;
+     }
+     case 0x05: {   /* UnmapMemory(dst, src, size) */
++        NOTE_MEMORY_CALL(0x05, x[0], x[1], x[2]);
+         for (u32 i = 0; i < 1024; i++)
+             if (maps[i].size && maps[i].dst == x[0]) {
+                 memcpy(G2H(maps[i].src), G2H(maps[i].dst), maps[i].size);
+@@ -582,11 +627,13 @@ void rt_svc(Cpu *c, u32 n) {
+         break;
+     }
+     case 0x2C:     /* MapPhysicalMemory(address, size): back part of the alias area with memory */
++        NOTE_MEMORY_CALL(0x2C, x[0], 0, x[1]);
+         commit(x[0], x[1], "physical memory");
+         kernel_add_region(x[0], x[1], GM_HEAP, 3);
+         x[0] = R_OK;
+         break;
+     case 0x2D:     /* UnmapPhysicalMemory(address, size) */
++        NOTE_MEMORY_CALL(0x2D, x[0], 0, x[1]);
+         gpu_memory_unmapping(x[0], x[1]);   /* (queued GPU work and the renderer may read it) */
+         VirtualFree(G2H(x[0]), x[1], MEM_DECOMMIT);
+         unmap_range(x[0], x[1]);
+@@ -648,6 +695,28 @@ void kernel_dump_threads(void) {
      LeaveCriticalSection(&klock);
  }
  
@@ -596,6 +702,7 @@ index 029ed2f..a84b86a 100644
 + * kernel's lock when another thread holds it - a frozen game may - since threads are never freed. */
 +void kernel_thread_stacks(void (*line)(const char *text)) {
 +    char text[160];
++    if (!nthreads) return;   /* (a stop before the kernel started: its lock not made yet) */
 +    int locked = TryEnterCriticalSection(&klock);
 +    if (!locked) {
 +        snprintf(text, sizeof text, "  (the kernel's lock is held by thread %lu: read without it)\n", (unsigned long)kernel_lock_owner());
@@ -1300,10 +1407,10 @@ index 0000000..267d2cd
 +#endif
 diff --git a/runtime/ps4/memory.c b/runtime/ps4/memory.c
 new file mode 100644
-index 0000000..b55da92
+index 0000000..d7938d9
 --- /dev/null
 +++ b/runtime/ps4/memory.c
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,695 @@
 +/* Memory for the PS4 build of the Windows API (runtime/linux/include/windows.h): VirtualAlloc and
 + * the rest, and the write watch - what runtime/linux/win32.c does on Linux and runtime/macos/
 + * memory.c on macOS, for a system with no demand-zero memory to speak of (the SMW port's design,
@@ -1441,26 +1548,57 @@ index 0000000..b55da92
 +    ps4_reserve_range(&p, size, MAP_FIXED_PS4, 0);
 +}
 +
-+/* Maps chunk `ci` of `a` with zeroes: read-only in a watched area, else read-write. (Under the lock.) */
++static u64 host_range(u64 size);
++
++/* Direct memory comes with whatever was there before: a chunk's is zeroed through a window of its
++ * own first, then mapped where it goes. Up to v00.16 it was mapped there and zeroed in place, and
++ * any other thread could reach it in between (it was mapped: nothing faulted): a write it made
++ * there was zeroed with the rest - the game's memory lost (the likely cause of v00.14's resource
++ * read as zeros and of v00.16's stop, FreeMemoryPages handed a range the game never had) - or, in
++ * a watched area, written while the chunk was still all writable, went unseen. (Under the lock.) */
++static u64 zero_window;
++
++static int zero_phys(u32 phys) {
++    if (!zero_window) zero_window = host_range(CHUNK);
++    if (!zero_window) return 0;
++    void *w = (void *)(uintptr_t)zero_window;
++    ps4_munmap(w, CHUNK);   /* (its reservation) */
++    if (ps4_map_direct(&w, CHUNK, PROT_RW, MAP_FIXED_PS4, (off_t)phys * (off_t)CHUNK, CHUNK) != 0 || w != (void *)(uintptr_t)zero_window) {
++        reserve_back(zero_window, CHUNK);
++        return 0;
++    }
++    memset(w, 0, CHUNK);
++    ps4_munmap(w, CHUNK);
++    reserve_back(zero_window, CHUNK);
++    return 1;
++}
++
++/* Maps chunk `ci` of `a`, zeroed: read-only in a watched area from the start (but for host pages
++ * with written pages), else read-write. (Under the lock.) */
 +static int map_chunk(Area *a, u64 ci) {
 +    u32 phys = take_phys();
 +    if (phys == NO_PHYS) { failed_maps++; return 0; }
++    if (!zero_phys(phys)) { give_phys(phys); failed_maps++; return 0; }
 +    u64 addr = a->base + ci * CHUNK;
 +    ps4_munmap((void *)(uintptr_t)addr, CHUNK);   /* (our reservation there: mapping over it fails) */
 +    void *at = (void *)(uintptr_t)addr;
-+    if (ps4_map_direct(&at, CHUNK, PROT_RW, MAP_FIXED_PS4, (off_t)phys * (off_t)CHUNK, CHUNK) != 0 || at != (void *)(uintptr_t)addr) {
++    int32_t r = ps4_map_direct(&at, CHUNK, a->watch ? PROT_R : PROT_RW, MAP_FIXED_PS4, (off_t)phys * (off_t)CHUNK, CHUNK);
++    if (r != 0 && a->watch) {   /* (should read-only be refused: read-write, then read-only at once) */
++        at = (void *)(uintptr_t)addr;
++        if ((r = ps4_map_direct(&at, CHUNK, PROT_RW, MAP_FIXED_PS4, (off_t)phys * (off_t)CHUNK, CHUNK)) == 0) ps4_mprotect(at, CHUNK, PROT_R);
++    }
++    if (r != 0 || at != (void *)(uintptr_t)addr) {
 +        reserve_back(addr, CHUNK);
 +        give_phys(phys);
 +        failed_maps++;
 +        return 0;
 +    }
-+    memset(at, 0, CHUNK);   /* (direct memory comes with whatever was there before) */
 +    if (a->watch) {
-+        /* host pages none of whose committed pages are written start read-only */
++        /* host pages some of whose committed pages are written are writable */
 +        for (u64 h = 0; h < CHUNK; h += HPAGE) {
 +            u64 first = (ci * CHUNK + h) / GPAGE, written = 0;
 +            for (u64 g = 0; g < HPAGE / GPAGE; g++) written |= (u64)bit(a->dirty, first + g);
-+            if (!written) ps4_mprotect((void *)(uintptr_t)(addr + h), HPAGE, PROT_R);
++            if (written) ps4_mprotect((void *)(uintptr_t)(addr + h), HPAGE, PROT_RW);
 +        }
 +    }
 +    a->phys[ci] = phys + 1;
@@ -1604,7 +1742,11 @@ index 0000000..b55da92
 +        for (u64 g = ci * CHUNK / GPAGE; g < (ci + 1) * CHUNK / GPAGE && !any; g++) any = bit(a->committed, g);
 +        if (!any) { unmap_chunk(a, ci); continue; }
 +        u64 c = a->base + ci * CHUNK, from = lo > c ? lo : c, to = hi < c + CHUNK ? hi : c + CHUNK;
-+        ps4_mprotect((void *)(uintptr_t)c, CHUNK, PROT_RW);
++        if (a->watch)   /* (only the host pages zeroed opened, as written: a committed page beside them then counts
++                         * as written too - never a write another thread makes meanwhile unseen) */
++            for (u64 h = round_down(from, HPAGE); h < to; h += HPAGE) open_page(a, h - a->base);
++        else
++            ps4_mprotect((void *)(uintptr_t)c, CHUNK, PROT_RW);
 +        memset((void *)(uintptr_t)from, 0, to - from);
 +        if (a->watch)   /* (back to read-only where nothing committed is written) */
 +            for (u64 h = 0; h < CHUNK; h += HPAGE) {
