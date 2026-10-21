@@ -29,6 +29,7 @@
 #include <atomic>
 
 extern "C" char __text_start[];                // the OpenOrbis link.x: the start of .text
+extern "C" char __eh_frame_start[];            // (after .text and the read-only data: the code's end, all of it mapped)
 extern "C" int pthread_getthreadid_np(void);   // libkernel (FreeBSD libthr)
 extern "C" int scePthreadGetname(pthread_t thread, char* name);
 extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
@@ -40,7 +41,6 @@ constexpr int kSigProf = 27;   // FreeBSD
 constexpr int kSaOnstack = 0x0001, kSaRestart = 0x0002, kSaSiginfo = 0x0040;
 constexpr int kMcontextOffset = 0x40, kRipIndex = 20, kRspIndex = 23;   // measured on hardware (ps4_crashlog.cpp)
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kSystemEnd = 0x1000000000ULL;
-constexpr uintptr_t kTextWindow = 0x40000000;
 constexpr uint64_t kWaitingTag = 1ULL << 63;
 constexpr int kSlots = 128, kRing = 2048, kCallers = 3;   // threads alive at once; samples a thread per profile
 constexpr long kPeriodNs = 4000000;         // a round every 4 ms
@@ -86,12 +86,15 @@ void onProf(int, siginfo_t*, void* context) {
         const auto* code = reinterpret_cast<const uint8_t*>(rip);
         if (((rip & 0xFFF) >= 2 && code[-2] == 0x0F && code[-1] == 0x05) || (code[0] == 0x0F && code[1] == 0x05))
             rip |= kWaitingTag;
-        const uintptr_t rsp = regs[kRspIndex], text = reinterpret_cast<uintptr_t>(__text_start);
+        const uintptr_t rsp = regs[kRspIndex], text = reinterpret_cast<uintptr_t>(__text_start),
+                        text_end = reinterpret_cast<uintptr_t>(__eh_frame_start);
         const uintptr_t limit = std::min<uintptr_t>(rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : rsp + 4096,
                                                     rsp + 16384);
         for (uintptr_t at = rsp & ~7ull; at + 8 <= limit && ncallers < kCallers; at += 8) {
             const uint64_t v = *reinterpret_cast<const uint64_t*>(at);
-            if (v < text + 8 || v >= text + kTextWindow)
+            // (only addresses inside the eboot's image: v00.12 read the bytes before a float on the
+            // stack, 0x3f800000 - unmapped - when the window was the 1 GiB after .text)
+            if (v < text + 8 || v >= text_end)
                 continue;
             const auto* r = reinterpret_cast<const uint8_t*>(v);
             if (r[-5] == 0xE8 || (r[-6] == 0xFF && r[-5] == 0x15) || (r[-2] == 0xFF && (r[-1] & 0x38) == 0x10) ||
@@ -171,7 +174,7 @@ void listModules() {
 // An address as the report writes it.
 void describe(uint64_t rip, char* out, size_t n) {
     const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
-    if (rip >= text && rip < text + kTextWindow) {
+    if (rip >= text && rip < reinterpret_cast<uintptr_t>(__eh_frame_start)) {
         snprintf(out, n, "elf 0x%llx", static_cast<unsigned long long>(rip - text));
         return;
     }
