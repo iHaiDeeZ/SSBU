@@ -62,6 +62,11 @@ extern "C" void ps4_port_start() {
     setenv("DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary = True", 0);
     // the renderer's details (frame times, draws, uploads, shaders compiling) in the log every 5 s
     setenv("SSBU_LOG_STATS", "1", 0);
+    // Profiles only when asked for (L3+R3; SSBU_AUTO_PROFILE=1 in env.txt: also when the frame rate
+    // drops, and a minute in): v00.13's two freezes (5 s, 409 s) each lasted exactly as long as the
+    // profile running then, and v00.14 crashed seconds after one - its signal every 4 ms to every
+    // game thread is not harmless while a match loads.
+    setenv("SSBU_AUTO_PROFILE", "0", 0);
     // the game's clock (it reads it thousands of times a frame) straight from the CPU's counter, not
     // through QueryPerformanceCounter and clock_gettime: v00.09's profile had the guest main thread
     // spend a tenth of its time in those
@@ -76,8 +81,10 @@ extern "C" void ps4_port_start() {
     mkdir("/data/SSBU/mesa", 0777);
     setenv("MESA_SHADER_CACHE_DIR", "/data/SSBU/mesa", 0);
     setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0);
-    // The 7th core, when the system grants it (it shares it): new threads may run on it too.
-    {
+    // The 7th core, when the system grants it (it shares it) and SSBU_SEVENTH_CORE=1 asks for it:
+    // new threads may run on it too. (Off by default since v00.15: v00.14, the first build with it,
+    // crashed loading a match - a timing the port may not be ready for.)
+    if (const char* want = std::getenv("SSBU_SEVENTH_CORE"); want && std::atoi(want) != 0) {
         void* self = scePthreadSelf();
         uint64_t had = 0, got = 0;
         scePthreadGetaffinity(self, &had);
@@ -85,7 +92,10 @@ extern "C" void ps4_port_start() {
         scePthreadSetaffinity(self, had);
         if (seventh)
             ps4_new_thread_cores = 0x7F;
-        std::fprintf(stderr, "[boot] cores: %s; new threads on %#llx\n", seventh ? "7, the 7th granted" : "6",
+        std::fprintf(stderr, "[boot] cores: %s; new threads on %#llx\n", seventh ? "7, the 7th granted" : "6 (the 7th refused)",
+                     static_cast<unsigned long long>(ps4_new_thread_cores));
+    } else {
+        std::fprintf(stderr, "[boot] cores: 6 (SSBU_SEVENTH_CORE=1 for the 7th); new threads on %#llx\n",
                      static_cast<unsigned long long>(ps4_new_thread_cores));
     }
     ps4_profile_thread_begin();   // (the main thread: the others from their start)

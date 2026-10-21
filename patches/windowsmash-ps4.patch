@@ -48,10 +48,29 @@ index e822de7..e498d1a 100644
      HMODULE m = LoadLibraryA("xinput1_4.dll");
      if (!m) m = LoadLibraryA("xinput9_1_0.dll");
 diff --git a/runtime/host.c b/runtime/host.c
-index ac98629..7a83fd4 100644
+index ac98629..30ab711 100644
 --- a/runtime/host.c
 +++ b/runtime/host.c
-@@ -459,7 +459,11 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+@@ -411,8 +411,18 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
+ 
+ int rt_ww_fault(void *address);        /* (linux/win32.c; macos/memory.c) a write the protecting write watch takes */
+ void rt_thread_signal_stack(void);
++#ifdef __ORBIS__
++extern __thread Cpu *rt_cpu_current;              /* (kernel.c: the guest thread's state) */
++extern char __text_start[], __eh_frame_start[];   /* (the OpenOrbis link.x: the eboot's code, its read-only data after it) */
++#endif
+ 
+ static void host_frame(const char *indent, void *pc) {   /* "[module +offset]" */
++#ifdef __ORBIS__   /* (the eboot has no dladdr: its ELF address, for llvm-symbolizer --obj=<the build's .elf>) */
++    if ((u64)pc - (u64)__text_start < (u64)(__eh_frame_start - __text_start)) {
++        out("%s[eboot elf %#llx]\n", indent, (u64)pc - (u64)__text_start);
++        return;
++    }
++#endif
+     Dl_info di;
+     if (dladdr(pc, &di) && di.dli_fname) {
+         const char *base = strrchr(di.dli_fname, '/');
+@@ -459,45 +469,169 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
  }
  #else
  /* Another thread's frames: it is interrupted and records its own stack. */
@@ -63,7 +82,60 @@ index ac98629..7a83fd4 100644
  static void *bt_frames[96];
  static volatile int bt_count;
  static sem_t bt_done;
-@@ -483,7 +487,11 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
++#ifdef __ORBIS__
++static u64 bt_guest[32];
++static volatile int bt_guest_count;
++
++/* The guest's own frame records ({x29, x30} on its stack, x29 pointing at them: the recompiled
++ * code keeps them as the game's does), from the x29 and x30 its code last stored in its state -
++ * stored before every call, so in a leaf function they are its caller's. Return addresses,
++ * innermost first; nothing of the host's frames needed. */
++static int guest_walk(const Cpu *c, u64 *ras, int max) {
++    int n = 0;
++    if (!c || max <= 0) return 0;
++    if (c->x[30]) ras[n++] = c->x[30];
++    for (u64 fp = c->x[29]; n < max && fp && !(fp & 7) && rt_readable(G2H(fp), 16);) {
++        u64 next = ld64(fp), ra = ld64(fp + 8);
++        if (!ra) break;
++        ras[n++] = ra;
++        if (next <= fp || next - fp > (64ull << 20)) break;
++        fp = next;
++    }
++    return n;
++}
++#endif
+ 
+ static void on_backtrace_signal(int sig, siginfo_t *si, void *uc) {
+     (void)sig; (void)si; (void)uc;
+     int saved = errno;
++#ifdef __ORBIS__   /* (from the interrupted context: _Unwind_Backtrace stops at the signal frame here) */
++    const mcontext_t *m = &((const ucontext_t *)uc)->uc_mcontext;
++    bt_count = rt_frame_walk((u64)m->mc_rip, 0, (u64)m->mc_rbp, bt_frames, 96);
++    bt_guest_count = guest_walk(rt_cpu_current, bt_guest, 32);
++#else
+     bt_count = backtrace(bt_frames, 96);
++#endif
+     sem_post(&bt_done);
+     errno = saved;
+ }
+ 
+-void rt_backtrace_thread(HANDLE thread, int max_frames) {
++static void line_to_stderr(const char *text) { fputs(text, stderr); }
++
++void rt_backtrace_thread(HANDLE thread, int max_frames) { rt_backtrace_thread_lines(thread, max_frames, line_to_stderr); }
++
++/* (a line at a time: the PS4's freeze reports, kernel.c's kernel_thread_stacks) */
++void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text)) {
+     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+     pid_t tid = rt_thread_tid(thread);
+     if (!tid) return;
+     pthread_mutex_lock(&lock);
+     while (sem_trywait(&bt_done) == 0) {}   /* (an answer that came after its wait gave up) */
+     bt_count = 0;
++#ifdef __ORBIS__
++    bt_guest_count = 0;
++#endif
+     struct timespec until;
      clock_gettime(CLOCK_REALTIME, &until);
      until.tv_nsec += 250000000L;
      if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
@@ -74,8 +146,105 @@ index ac98629..7a83fd4 100644
 +#endif
          static int host_frames = -1;
          if (host_frames < 0) host_frames = getenv("SSBU_HOST_FRAMES") != NULL;
-         char name[96];
-@@ -513,6 +521,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+-        char name[96];
+-        for (int i = 2, shown = 0; i < bt_count && shown < max_frames; i++) {   /* (past the handler and the signal frame) */
++        char name[96], text[200];
++#ifdef __ORBIS__
++        int first = 0;   /* (the walk starts at the interrupted code) */
++#else
++        int first = 2;   /* (past the handler and the signal frame) */
++#endif
++        for (int i = first, shown = 0; i < bt_count && shown < max_frames; i++) {
+             u64 guest = guest_of((u64)bt_frames[i]);
+             if (!guest) { if (host_frames) host_frame("      ", bt_frames[i]); continue; }
+-            fprintf(stderr, "      %s\n", rt_describe(guest, name, sizeof name));
++            snprintf(text, sizeof text, "      %s\n", rt_describe(guest, name, sizeof name));
++            line(text);
+             shown++;
+         }
++#ifdef __ORBIS__
++        for (int i = 0; i < bt_guest_count && i < max_frames; i += 4) {   /* (the guest's frame records: its calls) */
++            size_t len = (size_t)snprintf(text, sizeof text, "      %s", i ? "  " : "return addresses:");
++            for (int k = i; k < i + 4 && k < bt_guest_count && k < max_frames && len < sizeof text; k++)
++                len += (size_t)snprintf(text + len, sizeof text - len, " %s", rt_describe(bt_guest[k], name, sizeof name));
++            if (len > sizeof text - 2) len = sizeof text - 2;
++            text[len] = '\n';
++            text[len + 1] = 0;
++            line(text);
++        }
++#endif
+     }
+     pthread_mutex_unlock(&lock);
+ }
+ #endif
+ 
++#ifdef __ORBIS__
++/* 32 bytes at v (rounded down to 16), when it points at memory that can be read and is not the
++ * eboot's code or constants - once each, 24 at most. */
++static void dump_at(u64 v, u64 *seen, int *nseen) {
++    u64 at = v & ~15ull;
++    if (v < 0x10000 || *nseen >= 24 || v - (u64)__text_start < (u64)(__eh_frame_start - __text_start)) return;
++    for (int i = 0; i < *nseen; i++) if (seen[i] == at) return;
++    if (!rt_readable((const void *)(uintptr_t)at, 32)) return;
++    seen[(*nseen)++] = at;
++    const u8 *b = (const u8 *)(uintptr_t)at;
++    char hex[128];
++    size_t len = 0;
++    for (int i = 0; i < 32; i++) len += (size_t)snprintf(hex + len, sizeof hex - len, i % 8 == 7 && i < 31 ? "%02x  " : "%02x ", b[i]);
++    out("  %016llx: %s\n", at, hex);
++}
++
++/* What else a fault leaves for the PS4's reports (no debugger, no core dump to read): the host
++ * registers; the guest's as its code last stored them, and its own frame records; the faulting
++ * frame's stack, its callers' saved registers among it; and the memory those values point at. */
++static void fault_details(const ucontext_t *uc) {
++    const mcontext_t *m = &uc->uc_mcontext;
++    static const char *const names[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
++                                          "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
++    const u64 regs[16] = {(u64)m->mc_rax, (u64)m->mc_rbx, (u64)m->mc_rcx, (u64)m->mc_rdx, (u64)m->mc_rsi, (u64)m->mc_rdi,
++                          (u64)m->mc_rbp, (u64)m->mc_rsp, (u64)m->mc_r8, (u64)m->mc_r9, (u64)m->mc_r10, (u64)m->mc_r11,
++                          (u64)m->mc_r12, (u64)m->mc_r13, (u64)m->mc_r14, (u64)m->mc_r15};
++    char name[96];
++    out("host registers (the eboot's code at %p: an address minus that is its ELF address):\n", (void *)__text_start);
++    for (int i = 0; i < 16; i += 4)
++        out("  %-3s %016llx  %-3s %016llx  %-3s %016llx  %-3s %016llx\n", names[i], regs[i], names[i + 1], regs[i + 1],
++            names[i + 2], regs[i + 2], names[i + 3], regs[i + 3]);
++    const Cpu *c = rt_cpu_current;
++    if (c) {
++        out("guest registers (as its code last stored them):\n");
++        for (int i = 0; i < 31; i += 4) {
++            char text[160];
++            size_t len = 0;
++            for (int k = i; k < i + 4 && k < 31; k++) len += (size_t)snprintf(text + len, sizeof text - len, "  x%-2d %016llx", k, c->x[k]);
++            out("%s\n", text);
++        }
++        out("  sp  %016llx\n", c->sp);
++        u64 ras[32];
++        int n = guest_walk(c, ras, 32);
++        out("guest frame records (return addresses, innermost first):\n");
++        for (int i = 0; i < n; i++) out("  %s\n", rt_describe(ras[i], name, sizeof name));
++    }
++    out("host stack from rsp:\n");
++    u64 words[64], base = (u64)m->mc_rsp & ~7ull;
++    int nwords = 0;
++    for (u64 at = base; nwords < 64 && rt_readable((const void *)(uintptr_t)at, 32); at += 32) {
++        const u64 *w = (const u64 *)(uintptr_t)at;
++        out("  +%03llx  %016llx %016llx %016llx %016llx\n", at - base, w[0], w[1], w[2], w[3]);
++        for (int k = 0; k < 4; k++) words[nwords++] = w[k];
++    }
++    out("memory those point at (not the host stack's own, shown above):\n");
++    u64 seen[24];
++    int nseen = 0;
++    for (int i = 0; i < 16; i++) if (regs[i] - base >= (1ull << 20)) dump_at(regs[i], seen, &nseen);
++    for (int i = 0; i < nwords; i++) if (words[i] - base >= (1ull << 20)) dump_at(words[i], seen, &nseen);
++    if (c) for (int i = 0; i < 31; i++) dump_at(c->x[i], seen, &nseen);
++}
++#endif
++
+ /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
+  * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
+  * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
+@@ -513,6 +647,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      static volatile RtTid reporter;
      RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
      (void)si;
@@ -90,7 +259,7 @@ index ac98629..7a83fd4 100644
  #else
      int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
      if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
-@@ -530,6 +546,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -530,6 +672,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
  #ifdef __APPLE__
      u64 sp = uc->uc_mcontext->__ss.__sp;
      int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
@@ -100,7 +269,26 @@ index ac98629..7a83fd4 100644
  #else
      u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
      int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
-@@ -906,6 +925,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
+@@ -551,6 +696,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+     void *frames[64];
+ #ifdef __APPLE__   /* (from the faulting context: a leaf function's caller is in the link register) */
+     int n = walk_frames(pc, uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ss.__fp, frames, 64), from = 0;
++#elif defined(__ORBIS__)   /* (from the faulting context: _Unwind_Backtrace stops at the signal frame here) */
++    int n = rt_frame_walk(pc, 0, (u64)uc->uc_mcontext.mc_rbp, frames, 64), from = 0;
+ #else
+     int n = backtrace(frames, 64), from = 0;
+     for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
+@@ -558,6 +705,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+     for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
+     gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
+     print_frames(frames + from, n - from);
++#ifdef __ORBIS__
++    fault_details(uc);
++#endif
+     report_close(report);
+     fflush(stderr);
+     _exit(5);
+@@ -906,6 +1056,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
      const RtModule *mod = NULL;
      for (u32 k = 0; k < rt_nro_count && !mod; k++)
          if (!strcmp(rt_nro_modules[k]->build_id, id)) mod = rt_nro_modules[k];
@@ -115,7 +303,7 @@ index ac98629..7a83fd4 100644
      if (!mod || module_count == MAX_MODULES) { ReleaseSRWLockExclusive(&lock); return 0; }
      u32 m = module_count;
      modules[m] = mod;
-@@ -1075,6 +1102,10 @@ int main(int argc, char **argv) {
+@@ -1075,6 +1233,10 @@ int main(int argc, char **argv) {
  #endif
  #ifdef __APPLE__
      mac_start(argc, argv, &dir, &options);
@@ -126,6 +314,20 @@ index ac98629..7a83fd4 100644
  #endif
      if (!dir) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
      display_dpi_aware();
+diff --git a/runtime/host.h b/runtime/host.h
+index 5cdc854..3cd4070 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -51,7 +51,9 @@ u64 rt_symbol(const char *name);                       /* guest address of an ex
+ const char *rt_describe(u64 guest_addr, char *buf, size_t n);   /* "module+0x1234" */
+ void rt_backtrace(void);
+ void rt_backtrace_thread(HANDLE thread, int max_frames);   /* another thread's guest frames */
++void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text));   /* (Linux, the PS4) */
+ void kernel_dump_threads(void);
++void kernel_thread_stacks(void (*line)(const char *text));   /* (the PS4: every guest thread's, for a freeze report) */
+ _Noreturn void rt_fatal(const char *fmt, ...);         /* message + guest backtrace, then exit */
+ extern int rt_trace;
+ extern const char *rt_data_dir;                        /* where the module images (and romfs.cfg) live */
 diff --git a/runtime/ipc_audio.c b/runtime/ipc_audio.c
 index e1a7bdf..a3a5fff 100644
 --- a/runtime/ipc_audio.c
@@ -193,8 +395,72 @@ index e1a7bdf..a3a5fff 100644
  #else
      SDL_AudioSpec want, got;
      memset(&want, 0, sizeof want);
+diff --git a/runtime/kernel.c b/runtime/kernel.c
+index 029ed2f..a84b86a 100644
+--- a/runtime/kernel.c
++++ b/runtime/kernel.c
+@@ -207,6 +207,11 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32
+  * which on macOS leaves the signal mask alone - nothing changes it on a guest thread.) */
+ static __thread jmp_buf *exit_point;
+ #endif
++#ifdef __ORBIS__
++/* The PS4: the guest thread's state, for the crash and freeze reports (host.c: its registers as
++ * its code last stored them, and the guest's own frame records from there). */
++__thread Cpu *rt_cpu_current;
++#endif
+ 
+ static _Noreturn void exit_thread(KThread *t) {
+     EnterCriticalSection(&klock);
+@@ -235,6 +240,9 @@ static DWORD WINAPI thread_main(LPVOID param) {
+     jmp_buf out;
+     exit_point = &out;
+     if (RT_SETJMP(out)) return 0;
++#endif
++#ifdef __ORBIS__
++    rt_cpu_current = t->cpu;
+ #endif
+     rt_call(t->cpu, t->entry);
+     exit_thread(t);
+@@ -250,6 +258,9 @@ Cpu *kernel_main_thread(u32 *handle) {
+     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host, 0, FALSE, DUPLICATE_SAME_ACCESS);
+     LeaveCriticalSection(&klock);
+     *handle = t->handle;
++#ifdef __ORBIS__
++    rt_cpu_current = t->cpu;
++#endif
+     return t->cpu;
+ }
+ 
+@@ -648,6 +659,27 @@ void kernel_dump_threads(void) {
+     LeaveCriticalSection(&klock);
+ }
+ 
++#ifdef __ORBIS__
++/* The PS4's freeze report: every guest thread's stack (runtime/ps4/profile.c). Read without the
++ * kernel's lock when another thread holds it - a frozen game may - since threads are never freed. */
++void kernel_thread_stacks(void (*line)(const char *text)) {
++    char text[160];
++    int locked = TryEnterCriticalSection(&klock);
++    if (!locked) {
++        snprintf(text, sizeof text, "  (the kernel's lock is held by thread %lu: read without it)\n", (unsigned long)kernel_lock_owner());
++        line(text);
++    }
++    for (u32 i = 1; i < 4096; i++) {
++        KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
++        if (!t || !t->started || t->exited || !t->host) continue;
++        snprintf(text, sizeof text, "  guest thread %llu (host thread %lu, priority %d):\n", t->id, (unsigned long)GetThreadId(t->host), t->priority);
++        line(text);
++        rt_backtrace_thread_lines(t->host, 16, line);
++    }
++    if (locked) LeaveCriticalSection(&klock);
++}
++#endif
++
+ u32 kernel_new_session(void *session) {
+     EnterCriticalSection(&klock);
+     u32 h = new_handle(OBJ_SESSION, NULL);
 diff --git a/runtime/linux/include/windows.h b/runtime/linux/include/windows.h
-index cbd4af5..fffc7d7 100644
+index cbd4af5..05199a1 100644
 --- a/runtime/linux/include/windows.h
 +++ b/runtime/linux/include/windows.h
 @@ -6,6 +6,9 @@
@@ -238,6 +504,18 @@ index cbd4af5..fffc7d7 100644
      return TRUE;
  }
  static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
+@@ -416,6 +424,11 @@ BOOL IsDebuggerPresent(void);   /* (a tracer is attached: /proc/self/status; mac
+ int rt_frame_walk(uint64_t pc, uint64_t lr, uint64_t fp, void **frames, int max);
+ int rt_thread_frames(unsigned thread_id, void **frames, int max, uint64_t *pc, uint64_t *lr);
+ const char *rt_exe_path(void);
++#elif defined(__ORBIS__)
++/* The PS4 (runtime/ps4/platform.c): a frame-pointer chain from a signal handler's context (pc
++ * first, then each return address), and whether memory can be read - both without faulting. */
++int rt_frame_walk(uint64_t pc, uint64_t lr, uint64_t fp, void **frames, int max);
++int rt_readable(const void *p, size_t n);
+ #endif
+ typedef struct _EXCEPTION_POINTERS EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;   /* (only pointed to: no SEH on Linux) */
+ /* The game window's keyboard and focus, from the window system (runtime/linux/window.c;
 diff --git a/runtime/linux/win32.c b/runtime/linux/win32.c
 index b56617b..9b12b93 100644
 --- a/runtime/linux/win32.c
@@ -1633,13 +1911,13 @@ index 0000000..0af8d3c
 +}
 diff --git a/runtime/ps4/platform.c b/runtime/ps4/platform.c
 new file mode 100644
-index 0000000..95981a3
+index 0000000..c935bba
 --- /dev/null
 +++ b/runtime/ps4/platform.c
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,133 @@
 +/* What the PS4 build of the Windows API (runtime/linux/win32.c) needs from the system that Linux
 + * has and the PS4 lacks: waiting on an address (Linux's futex) and walking the stack (glibc's
-+ * backtrace).
++ * backtrace; frame records from a signal handler's context).
 + *
 + * Waiting on an address: the PS4's kernel has no futex for applications, so waiters sleep on one
 + * of 256 condition variables picked by the address. A wake wakes every waiter on its variable -
@@ -1647,9 +1925,11 @@ index 0000000..95981a3
 + * with a futex's spurious wakeups). The value is checked under the variable's lock, which the
 + * waker takes before it wakes, so a change between the check and the sleep is never missed. */
 +#include <errno.h>
++#include <fcntl.h>
 +#include <pthread.h>
 +#include <stdint.h>
 +#include <time.h>
++#include <unistd.h>
 +#include <unwind.h>
 +
 +#include <windows.h>
@@ -1728,18 +2008,60 @@ index 0000000..95981a3
 +    _Unwind_Backtrace(walk_one, &w);
 +    return w.n;
 +}
++
++/* Whether [p, p + n) can be read (n up to 64), without touching it: the kernel copies it into a
++ * pipe and reports EFAULT instead of faulting - for the walks of a crash report, which a fault in
++ * the handler would end with nothing more written (memory mapped on first touch reads as not
++ * there: runtime/ps4/memory.c). */
++static int probe[2] = {-1, -1};
++
++__attribute__((constructor)) static void probe_init(void) {
++    if (pipe(probe) != 0) { probe[0] = probe[1] = -1; return; }
++    fcntl(probe[0], F_SETFL, O_NONBLOCK);
++    fcntl(probe[1], F_SETFL, O_NONBLOCK);
++}
++
++int rt_readable(const void *p, size_t n) {
++    char drain[64];
++    if (probe[0] < 0 || n > sizeof drain) return 0;
++    while (read(probe[0], drain, sizeof drain) > 0) {}
++    return write(probe[1], p, n) == (ssize_t)n;
++}
++
++/* A thread's frames from its registers, for a signal handler (where _Unwind_Backtrace stops at
++ * the signal frame): frame records ({the caller's rbp, the return address}, rbp pointing at them -
++ * the eboot's code, recompiled and runtime alike, keeps rbp a frame pointer), each checked
++ * readable first. One that is not, or not above the last, ends the walk. (lr: x86-64 has none;
++ * a function that keeps no frame - a system call's stub - is passed over to its caller.) */
++int rt_frame_walk(uint64_t pc, uint64_t lr, uint64_t fp, void **frames, int max) {
++    int n = 0;
++    if (max <= 0) return 0;
++    frames[n++] = (void *)(uintptr_t)pc;
++    if (lr && n < max) frames[n++] = (void *)(uintptr_t)lr;
++    while (n < max && fp && !(fp & 7) && rt_readable((const void *)(uintptr_t)fp, 16)) {
++        const u64 *record = (const u64 *)(uintptr_t)fp;
++        u64 next = record[0], ra = record[1];
++        if (!ra) break;
++        frames[n++] = (void *)(uintptr_t)ra;
++        if (next <= fp || next - fp > (256ull << 20)) break;
++        fp = next;
++    }
++    return n;
++}
 diff --git a/runtime/ps4/profile.c b/runtime/ps4/profile.c
 new file mode 100644
-index 0000000..68fb57e
+index 0000000..7af2f12
 --- /dev/null
 +++ b/runtime/ps4/profile.c
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,68 @@
 +/* The sampling profiler on the PS4: the port's (port/ps4_profile.cpp in the SSBU repo), which samples
 + * the game's own threads for a few seconds and writes /data/SSBU/profiles/profile_<n>.txt (its
 + * addresses named on the PC: scripts/profile.py). Started by F6's callers (L3+R3: pad.c) and, here,
 + * when the frame rate drops: under 30 frames a second for two seconds in a row starts one (one a
 + * half minute at most, six a run), and one is taken a minute after the first frame for comparison.
-+ * SSBU_AUTO_PROFILE=0: only L3+R3. The freeze reports' thread stacks are the port's crash log's. */
++ * SSBU_AUTO_PROFILE=0: only L3+R3 (the SSBU port's default since v00.15: v00.13's 409 s freeze and
++ * v00.14's crash both came during or just after one). The freeze reports' thread stacks: every
++ * guest thread's, walked from its own registers (kernel.c, host.c). */
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <time.h>
@@ -1748,13 +2070,17 @@ index 0000000..68fb57e
 +
 +_Bool ps4_profile_start(double seconds, const char *reason);   /* port/ps4_profile.cpp */
 +int ps4_profile_running(void);
++void kernel_thread_stacks(void (*line)(const char *text));     /* kernel.c */
 +
 +void profile_start(double seconds) {
 +    if (!ps4_profile_start(seconds, "asked for (L3+R3)")) fprintf(stderr, "[profile] one is running already\n");
 +    else fprintf(stderr, "[profile] sampling for %.0f s (asked for)\n", seconds);
 +}
 +int profile_running(void) { return ps4_profile_running(); }
-+int profile_dump_threads(void (*line)(const char *text)) { (void)line; return 0; }
++int profile_dump_threads(void (*line)(const char *text)) {
++    kernel_thread_stacks(line);
++    return 1;
++}
 +
 +static double now_s(void) {
 +    struct timespec ts;

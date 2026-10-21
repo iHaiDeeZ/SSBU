@@ -1,7 +1,7 @@
 From 713601e6e34378c5a27e6bcd0ab3164ee4583cd8 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:02:12 +0300
-Subject: [PATCH 1/3] SSBU: address32_hi and the vertex fetch rule in the
+Subject: [PATCH 1/4] SSBU: address32_hi and the vertex fetch rule in the
  shader cache's identity
 
 ---
@@ -38,7 +38,7 @@ index 411bd7f..852e25d 100644
 From 2bfa409ad17d04d2cf6ec782c6f426b24e15df7b Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:05:45 +0300
-Subject: [PATCH 2/3] SSBU: the shader cache's hits and misses in the log;
+Subject: [PATCH 2/4] SSBU: the shader cache's hits and misses in the log;
  Mesa's own-user check off on the PS4
 
 ---
@@ -89,7 +89,7 @@ index 9608e97..2cf6459 100644
 From d2abe4fce779270dfdb3ee7c9d4ffa33a92d8eb4 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:08:32 +0300
-Subject: [PATCH 3/3] SSBU: the disk cache's index in memory on the PS4 (no
+Subject: [PATCH 3/4] SSBU: the disk cache's index in memory on the PS4 (no
  shared file mapping)
 
 ---
@@ -135,6 +135,71 @@ index f31c8dc..6ea537a 100644
  }
  
  void *
+-- 
+2.53.0
+
+
+From 784d71e7e6a690c82b7d5a9deef49c28d2666692 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 18:28:14 +0300
+Subject: [PATCH 4/4] SSBU: the shader cache's folder read with getenv on the
+ PS4 (OpenOrbis's secure_getenv returns nothing), its files used without flock
+ where the file system has none, its start in the log
+
+---
+ src/util/disk_cache.c   | 5 +++++
+ src/util/fossilize_db.c | 6 ++++++
+ src/util/os_misc.c      | 4 +++-
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index b58427c..6c26acc 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -169,6 +169,11 @@ disk_cache_type_create(const char *gpu_name,
+    cache->path_init_failed = false;
+ 
+  path_fail:
++#ifdef __PS4__
++   /* (on with its folder; off with a folder: its files could not be opened or read) */
++   fprintf(stderr, "mesa: shader cache %s (%s)\n", cache->path_init_failed ? "off" : "on",
++           cache->path ? cache->path : "no folder: MESA_SHADER_CACHE_DIR unread, or the folder not made");
++#endif
+ 
+    cache->driver_keys_blob_size = cv_size;
+ 
+diff --git a/src/util/fossilize_db.c b/src/util/fossilize_db.c
+index 1ae5e59..0072273 100644
+--- a/src/util/fossilize_db.c
++++ b/src/util/fossilize_db.c
+@@ -205,6 +205,12 @@ static int lock_file_with_timeout(FILE *f, int64_t timeout)
+          break;
+       usleep(1000);
+    }
++#ifdef __PS4__
++   /* (only the game itself writes the PS4's cache: a file system without the lock is no reason
++    * to go without the cache) */
++   if (err == -1 && errno != EAGAIN)
++      err = 0;
++#endif
+    return err;
+ }
+ 
+diff --git a/src/util/os_misc.c b/src/util/os_misc.c
+index ee2b790..367e7e9 100644
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -225,7 +225,9 @@ os_get_option_internal(const char *name, bool use_secure_getenv)
+ {
+    const char *opt;
+    if (use_secure_getenv) {
+-#ifdef HAVE_SECURE_GETENV
++      /* (not on the PS4: OpenOrbis's musl takes the app for a set-id one - no auxiliary vector to
++       * say otherwise - and its secure_getenv returns nothing, MESA_SHADER_CACHE_DIR included) */
++#if defined(HAVE_SECURE_GETENV) && !defined(__PS4__)
+       opt = secure_getenv(name);
+ #else
+       opt = getenv(name);
 -- 
 2.53.0
 
