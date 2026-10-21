@@ -81,6 +81,10 @@ extern "C" void ps4_port_start() {
     mkdir("/data/SSBU/mesa", 0777);
     setenv("MESA_SHADER_CACHE_DIR", "/data/SSBU/mesa", 0);
     setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0);
+    // and the shader pack made on the PC (scripts/build-shaderpack.sh: every shader of the game, compiled by the same
+    // RADV for this GPU), ssbu_pack.foz and ssbu_pack_idx.foz next to that cache's own files, read-only: a shader the
+    // game meets for the first time is then read, not compiled. (Mesa leaves out a pack that is not there.)
+    setenv("MESA_DISK_CACHE_READ_ONLY_FOZ_DBS", "ssbu_pack", 0);
     // The 7th core, when the system grants it (it shares it) and SSBU_SEVENTH_CORE=1 asks for it:
     // new threads may run on it too. (Off by default since v00.15: v00.14, the first build with it,
     // crashed loading a match - a timing the port may not be ready for.)

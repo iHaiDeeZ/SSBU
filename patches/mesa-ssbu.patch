@@ -1,7 +1,7 @@
 From 713601e6e34378c5a27e6bcd0ab3164ee4583cd8 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:02:12 +0300
-Subject: [PATCH 1/4] SSBU: address32_hi and the vertex fetch rule in the
+Subject: [PATCH 1/5] SSBU: address32_hi and the vertex fetch rule in the
  shader cache's identity
 
 ---
@@ -38,7 +38,7 @@ index 411bd7f..852e25d 100644
 From 2bfa409ad17d04d2cf6ec782c6f426b24e15df7b Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:05:45 +0300
-Subject: [PATCH 2/4] SSBU: the shader cache's hits and misses in the log;
+Subject: [PATCH 2/5] SSBU: the shader cache's hits and misses in the log;
  Mesa's own-user check off on the PS4
 
 ---
@@ -89,7 +89,7 @@ index 9608e97..2cf6459 100644
 From d2abe4fce779270dfdb3ee7c9d4ffa33a92d8eb4 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:08:32 +0300
-Subject: [PATCH 3/4] SSBU: the disk cache's index in memory on the PS4 (no
+Subject: [PATCH 3/5] SSBU: the disk cache's index in memory on the PS4 (no
  shared file mapping)
 
 ---
@@ -142,7 +142,7 @@ index f31c8dc..6ea537a 100644
 From 784d71e7e6a690c82b7d5a9deef49c28d2666692 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 18:28:14 +0300
-Subject: [PATCH 4/4] SSBU: the shader cache's folder read with getenv on the
+Subject: [PATCH 4/5] SSBU: the shader cache's folder read with getenv on the
  PS4 (OpenOrbis's secure_getenv returns nothing), its files used without flock
  where the file system has none, its start in the log
 
@@ -200,6 +200,668 @@ index ee2b790..367e7e9 100644
        opt = secure_getenv(name);
  #else
        opt = getenv(name);
+-- 
+2.53.0
+
+
+From 58bd263431402668cf0dd06ddadc25c3bf892b9d Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 19:09:48 +0300
+Subject: [PATCH 5/5] SSBU: the PS4's device answers in ac_ps4_info.h, shared
+ with a PC build (AC_PS4_HOST_IDENTITY: ac_linux_drm.c answers as the console,
+ conditional rendering off) that fills the PS4's shader cache
+
+---
+ src/amd/common/ac_linux_drm.c         |  70 +++++++++
+ src/amd/common/ac_ps4_drm.c           | 161 ++-------------------
+ src/amd/common/ac_ps4_info.h          | 196 ++++++++++++++++++++++++++
+ src/amd/vulkan/radv_physical_device.c |   4 +-
+ 4 files changed, 282 insertions(+), 149 deletions(-)
+ mode change 100755 => 100644 src/amd/common/ac_ps4_drm.c
+ create mode 100644 src/amd/common/ac_ps4_info.h
+
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index 777c134..0295004 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -18,6 +18,16 @@
+ #include "virtio/amdgpu_virtio.h"
+ #endif
+ 
++#ifdef AC_PS4_HOST_IDENTITY
++/* A PC build that compiles shaders for the PS4 (the SSBU port's shader pack): the device these
++ * queries describe is the PS4's, as ac_ps4_drm.c answers them on the console (ac_ps4_info.h),
++ * whatever drm-shim stands in for underneath - the shader cache's keys and the code it holds
++ * depend on it. Its GPU windows are where the console has always reserved them. */
++#include "ac_ps4_info.h"
++#define AC_PS4_HOST_VA_START 0x4000000000ull
++#define AC_PS4_HOST_VA32_START 0x4400000000ull
++#endif
++
+ struct ac_drm_device {
+    union {
+       amdgpu_device_handle adev;
+@@ -69,6 +79,12 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
+    else
+       free(*dev);
+ 
++#ifdef AC_PS4_HOST_IDENTITY
++   if (r == 0) {
++      *major_version = AC_PS4_DRM_MAJOR;
++      *minor_version = AC_PS4_DRM_MINOR;
++   }
++#endif
+    return r;
+ }
+ 
+@@ -551,6 +567,9 @@ void ac_drm_cs_chunk_fence_info_to_data(uint32_t bo_handle, uint64_t offset,
+ 
+ int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return ac_ps4_query_info(info_id, size, value, AC_PS4_HOST_VA_START);
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -568,6 +587,9 @@ int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void
+ int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
+                              uint32_t instance, uint32_t flags, uint32_t *values)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return ac_ps4_read_mm_registers(dword_offset, count, values);
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -588,6 +610,10 @@ int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned
+ 
+ int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   *count = type == AMDGPU_HW_IP_GFX ? 1 : 0;
++   return 0;
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -606,6 +632,9 @@ int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
+ int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+                             struct drm_amdgpu_info_hw_ip *info)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return ac_ps4_hw_ip_info(type, info);
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -625,6 +654,11 @@ int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_insta
+ int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance,
+                                   unsigned index, uint32_t *version, uint32_t *feature)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   *version = AC_PS4_FW_VERSION;
++   *feature = AC_PS4_FW_FEATURE;
++   return 0;
++#endif
+    struct drm_amdgpu_info request;
+    struct drm_amdgpu_info_firmware firmware = {};
+    int r;
+@@ -654,6 +688,9 @@ int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned
+ int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+                                  struct drm_amdgpu_info_uq_metadata *info)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return -EINVAL;
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -675,6 +712,10 @@ int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_
+ 
+ int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   ac_ps4_gpu_info(info);
++   return 0;
++#endif
+    struct drm_amdgpu_info_device dev_info = {0};
+    int r, i;
+ 
+@@ -757,6 +798,10 @@ int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
+ int ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags,
+                            struct amdgpu_heap_info *info)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   ac_ps4_heap_info(heap, info);
++   return 0;
++#endif
+    struct drm_amdgpu_info_vram_gtt vram_gtt_info = {};
+    int r;
+ 
+@@ -802,6 +847,9 @@ int ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags,
+ 
+ int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned size, void *value)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return -EINVAL;
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -819,6 +867,9 @@ int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned
+ 
+ int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned size, void *value)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return -EINVAL;
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -836,6 +887,9 @@ int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned
+ 
+ int ac_drm_query_gpuvm_fault_info(ac_drm_device *dev, unsigned size, void *value)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return -EINVAL;
++#endif
+    struct drm_amdgpu_info request;
+ 
+    memset(&request, 0, sizeof(request));
+@@ -884,6 +938,9 @@ int ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags)
+ 
+ const char *ac_drm_get_marketing_name(ac_drm_device *dev)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   return AC_PS4_MARKETING_NAME;
++#endif
+ #ifdef HAVE_AMDGPU_VIRTIO
+    if (dev->is_virtio)
+       return amdvgpu_get_marketing_name(dev->vdev);
+@@ -894,6 +951,12 @@ const char *ac_drm_get_marketing_name(ac_drm_device *dev)
+ int ac_drm_query_sw_info(ac_drm_device *dev,
+                          enum amdgpu_sw_info info, void *value)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   if (info != amdgpu_sw_info_address32_hi)
++      return -EINVAL;
++   *(uint32_t *)value = AC_PS4_HOST_VA32_START >> 32;
++   return 0;
++#endif
+ #ifdef HAVE_AMDGPU_VIRTIO
+    if (dev->is_virtio) {
+       assert(info == amdgpu_sw_info_address32_hi);
+@@ -1093,6 +1156,13 @@ int ac_drm_userq_wait(ac_drm_device *dev, struct drm_amdgpu_userq_wait *wait_dat
+ 
+ int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
+ {
++#ifdef AC_PS4_HOST_IDENTITY
++   info->pci.domain = 0;
++   info->pci.bus = 0;
++   info->pci.dev = 1;
++   info->pci.func = 0;
++   return 0;
++#endif
+    if (dev->is_virtio && dev->fd < 0) {
+       info->pci.domain = 0;
+       info->pci.bus = 0;
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+old mode 100755
+new mode 100644
+index 234d846..fb0aea0
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -80,20 +80,9 @@ int sceKernelVirtualQuery(const void *addr, int flags, struct ps4_vq_info *info,
+ #define PS4_VA_HINT 0x4000000000ull /* search from 256 GiB */
+ #define PS4_GPU_VA_LIMIT 0x10000000000ull
+ 
+-/* Liverpool GB_TILE_MODE0..31 and GB_MACROTILE_MODE0..15, rebuilt from shadPS4's per-mode
+- * attributes (8 pipes P8_32x32_16x16, 16 banks), and GB_ADDR_CONFIG: 8 pipes, 256 B pipe
+- * interleave, 2 shader engines, 1 KiB DRAM rows. */
+-static const uint32_t ps4_tile_modes[32] = {
+-   0x00800310, 0x00800b10, 0x00801310, 0x00801b10, 0x00802310, 0x00800308, 0x00801318,
+-   0x00802318, 0x00000304, 0x00000308, 0x02000310, 0x02000294, 0x02000318, 0x00400308,
+-   0x02400310, 0x024002b0, 0x02400294, 0x02400318, 0x0240032c, 0x0100030c, 0x0100031c,
+-   0x010002b4, 0x010002a4, 0x01000328, 0x010002bc, 0x01000320, 0x010002b8, 0, 0, 0, 0, 0,
+-};
+-static const uint32_t ps4_macrotile_modes[16] = {
+-   0xe8, 0xd4, 0xd0, 0xd0, 0x80, 0x40, 0x00, 0x00, 0xec, 0xe8, 0xd4, 0xd0, 0x80, 0x40, 0x00, 0x00,
+-};
+-#define PS4_GB_ADDR_CONFIG 0x00011003
+-#define PS4_MC_ARB_RAMCFG 0x2 /* 16 banks */
++/* The tiling tables and the rest the queries answer: ac_ps4_info.h (shared with the PC build
++ * that fills the shader cache) */
++#include "ac_ps4_info.h"
+ 
+ struct amdgpu_bo {
+    uint32_t handle;
+@@ -1179,8 +1168,8 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
+    ps4_sync_provider_init(dev);
+ 
+    /* Report a recent amdgpu kernel (3.61) so that Mesa enables its normal paths. */
+-   *major_version = 3;
+-   *minor_version = 61;
++   *major_version = AC_PS4_DRM_MAJOR;
++   *minor_version = AC_PS4_DRM_MINOR;
+    *out = dev;
+    ps4_last_device = dev;
+    if (!ps4_fault_dev)
+@@ -3284,137 +3273,27 @@ ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t
+ }
+ 
+ /* ---------------------------------------------------------------------------------------------
+- * Queries: answer as the amdgpu kernel would for a Liverpool-like gfx7 APU
++ * Queries: answer as the amdgpu kernel would for a Liverpool-like gfx7 APU (ac_ps4_info.h)
+  */
+ 
+-#define PS4_VRAM_SIZE (2048ull << 20)
+-#define PS4_GTT_SIZE (1024ull << 20)
+-
+ int
+ ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
+ {
+-   memset(info, 0, sizeof(*info));
+-   info->asic_id = 0x9920; /* Liverpool */
+-   info->chip_external_rev = 0x14; /* Bonaire range: identified as CHIP_BONAIRE (gfx7) */
+-   info->family_id = FAMILY_CI;
+-   info->ids_flags = AMDGPU_IDS_FLAGS_FUSION;
+-   info->max_engine_clk = 800000;
+-   info->max_memory_clk = 1375000;
+-   info->num_shader_engines = 2;
+-   info->num_shader_arrays_per_engine = 1;
+-   info->rb_pipes = 8;
+-   info->enabled_rb_pipes_mask = 0xff;
+-   info->gpu_counter_freq = 100000; /* kHz */
+-   info->mc_arb_ramcfg = PS4_MC_ARB_RAMCFG;
+-   info->gb_addr_cfg = PS4_GB_ADDR_CONFIG;
+-   memcpy(info->gb_tile_mode, ps4_tile_modes, sizeof(ps4_tile_modes));
+-   memcpy(info->gb_macro_tile_mode, ps4_macrotile_modes, sizeof(ps4_macrotile_modes));
+-   info->cu_bitmap[0][0] = 0x1ff; /* 9 CUs per shader engine, 18 total */
+-   info->cu_bitmap[1][0] = 0x1ff;
+-   info->vram_type = AMDGPU_VRAM_TYPE_GDDR5;
+-   info->vram_bit_width = 256;
++   ac_ps4_gpu_info(info);
+    return 0;
+ }
+ 
+-static void
+-ps4_dev_info(ac_drm_device *dev, struct drm_amdgpu_info_device *d)
+-{
+-   memset(d, 0, sizeof(*d));
+-   d->device_id = 0x9920;
+-   d->external_rev = 0x14;
+-   d->family = FAMILY_CI;
+-   d->num_shader_engines = 2;
+-   d->num_shader_arrays_per_engine = 1;
+-   d->gpu_counter_freq = 100000;
+-   d->max_engine_clock = 800000;
+-   d->max_memory_clock = 1375000;
+-   d->cu_active_number = 18;
+-   d->cu_bitmap[0][0] = 0x1ff;
+-   d->cu_bitmap[1][0] = 0x1ff;
+-   d->enabled_rb_pipes_mask = 0xff;
+-   d->num_rb_pipes = 8;
+-   d->num_hw_gfx_contexts = 8;
+-   d->ids_flags = AMDGPU_IDS_FLAGS_FUSION;
+-   d->virtual_address_offset = dev->va_start;
+-   d->virtual_address_max = dev->va_start + PS4_VA_SIZE;
+-   d->virtual_address_alignment = PS4_PAGE;
+-   d->pte_fragment_size = PS4_PAGE;
+-   d->gart_page_size = 4096;
+-   d->vram_type = AMDGPU_VRAM_TYPE_GDDR5;
+-   d->vram_bit_width = 256;
+-   d->wave_front_size = 64;
+-   d->num_shader_visible_vgprs = 256;
+-   d->num_cu_per_sh = 9;
+-   d->num_tcc_blocks = 8;
+-   d->gs_vgt_table_depth = 32;
+-   d->gs_prim_buffer_depth = 1792;
+-   d->max_gs_waves_per_vgt = 32;
+-}
+-
+ int
+ ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
+ {
+-   memset(value, 0, size);
+-   switch (info_id) {
+-   case AMDGPU_INFO_DEV_INFO: {
+-      struct drm_amdgpu_info_device d;
+-      ps4_dev_info(dev, &d);
+-      memcpy(value, &d, MIN2(size, sizeof(d)));
+-      return 0;
+-   }
+-   case AMDGPU_INFO_MEMORY: {
+-      struct drm_amdgpu_memory_info m = {0};
+-      m.vram.total_heap_size = m.vram.usable_heap_size = PS4_VRAM_SIZE;
+-      m.vram.max_allocation = PS4_VRAM_SIZE;
+-      m.cpu_accessible_vram = m.vram;
+-      m.gtt.total_heap_size = m.gtt.usable_heap_size = PS4_GTT_SIZE;
+-      m.gtt.max_allocation = PS4_GTT_SIZE;
+-      memcpy(value, &m, MIN2(size, sizeof(m)));
+-      return 0;
+-   }
+-   case AMDGPU_INFO_VRAM_GTT: {
+-      struct drm_amdgpu_info_vram_gtt v = {PS4_VRAM_SIZE, PS4_VRAM_SIZE, PS4_GTT_SIZE};
+-      memcpy(value, &v, MIN2(size, sizeof(v)));
+-      return 0;
+-   }
+-   case AMDGPU_INFO_MAX_IBS: {
+-      uint32_t *max = value;
+-      if (size >= 4)
+-         max[AMDGPU_HW_IP_GFX] = 32;
+-      return 0;
+-   }
+-   case AMDGPU_INFO_TIMESTAMP:
+-      if (size >= 8)
+-         *(uint64_t *)value = os_time_get_nano() / 10; /* 100 MHz */
+-      return 0;
+-   case AMDGPU_INFO_VRAM_USAGE:
+-   case AMDGPU_INFO_GTT_USAGE:
+-   case AMDGPU_INFO_VIS_VRAM_USAGE:
+-   case AMDGPU_INFO_NUM_EVICTIONS:
+-   case AMDGPU_INFO_NUM_BYTES_MOVED:
+-   case AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS:
+-      return 0;
+-   default:
+-      return -EINVAL;
+-   }
++   return ac_ps4_query_info(info_id, size, value, dev->va_start);
+ }
+ 
+ int
+ ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
+                          uint32_t instance, uint32_t flags, uint32_t *values)
+ {
+-   for (unsigned i = 0; i < count; i++) {
+-      const unsigned reg = dword_offset + i;
+-      if (reg >= 0x2644 && reg < 0x2644 + 32)
+-         values[i] = ps4_tile_modes[reg - 0x2644];
+-      else if (reg >= 0x2664 && reg < 0x2664 + 16)
+-         values[i] = ps4_macrotile_modes[reg - 0x2664];
+-      else if (reg == 0x263e)
+-         values[i] = PS4_GB_ADDR_CONFIG;
+-      else
+-         return -EINVAL;
+-   }
+-   return 0;
++   return ac_ps4_read_mm_registers(dword_offset, count, values);
+ }
+ 
+ int
+@@ -3428,25 +3307,15 @@ int
+ ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+                         struct drm_amdgpu_info_hw_ip *info)
+ {
+-   /* Only the graphics ring: GNM's compute queues and SDMA aren't exposed. */
+-   if (type != AMDGPU_HW_IP_GFX)
+-      return -EINVAL;
+-   memset(info, 0, sizeof(*info));
+-   info->hw_ip_version_major = 7;
+-   info->hw_ip_version_minor = 0;
+-   info->ib_start_alignment = 32;
+-   info->ib_size_alignment = 32;
+-   info->available_rings = 1;
+-   return 0;
++   return ac_ps4_hw_ip_info(type, info);
+ }
+ 
+ int
+ ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance,
+                               unsigned index, uint32_t *version, uint32_t *feature)
+ {
+-   /* Recent CIK microcode. */
+-   *version = 0x1000;
+-   *feature = 0x40;
++   *version = AC_PS4_FW_VERSION;
++   *feature = AC_PS4_FW_FEATURE;
+    return 0;
+ }
+ 
+@@ -3461,9 +3330,7 @@ int
+ ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags,
+                        struct amdgpu_heap_info *info)
+ {
+-   memset(info, 0, sizeof(*info));
+-   info->heap_size = heap == AMDGPU_GEM_DOMAIN_VRAM ? PS4_VRAM_SIZE : PS4_GTT_SIZE;
+-   info->max_allocation = info->heap_size;
++   ac_ps4_heap_info(heap, info);
+    return 0;
+ }
+ 
+@@ -3500,7 +3367,7 @@ ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags)
+ const char *
+ ac_drm_get_marketing_name(ac_drm_device *device)
+ {
+-   return "AMD Liverpool (PS4)";
++   return AC_PS4_MARKETING_NAME;
+ }
+ 
+ int
+diff --git a/src/amd/common/ac_ps4_info.h b/src/amd/common/ac_ps4_info.h
+new file mode 100644
+index 0000000..b4e90f8
+--- /dev/null
++++ b/src/amd/common/ac_ps4_info.h
+@@ -0,0 +1,196 @@
++/*
++ * The PS4's GPU ("Liverpool", GCN gfx7) as the amdgpu kernel would describe it: the answers of the
++ * PS4 layer's queries (ac_ps4_drm.c), shared with a PC build of RADV that fills the PS4's shader
++ * cache ahead of time (AC_PS4_HOST_IDENTITY in ac_linux_drm.c). A cache entry is only found again
++ * on the console if the PC saw the very same device: what it hashes into the cache keys, and what
++ * the compiler is told (address32_hi, the CU and register counts), come from here.
++ *
++ * Copyright 2026 DolphinPS4. SPDX-License-Identifier: MIT
++ */
++
++#ifndef AC_PS4_INFO_H
++#define AC_PS4_INFO_H
++
++#include "ac_linux_drm.h"
++#include "addrlib/src/amdgpu_asic_addr.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
++
++#include <errno.h>
++#include <string.h>
++
++#define AC_PS4_VRAM_SIZE (2048ull << 20)
++#define AC_PS4_GTT_SIZE (1024ull << 20)
++#define AC_PS4_PAGE 0x4000ull         /* direct memory and mapping granularity */
++#define AC_PS4_VA_SIZE 0x0400000000ull /* the GPU VA window: 16 GiB */
++#define AC_PS4_DRM_MAJOR 3
++#define AC_PS4_DRM_MINOR 61
++#define AC_PS4_MARKETING_NAME "AMD Liverpool (PS4)"
++#define AC_PS4_FW_VERSION 0x1000 /* recent CIK microcode, for every firmware asked about */
++#define AC_PS4_FW_FEATURE 0x40
++
++/* Liverpool GB_TILE_MODE0..31 and GB_MACROTILE_MODE0..15, rebuilt from shadPS4's per-mode
++ * attributes (8 pipes P8_32x32_16x16, 16 banks), and GB_ADDR_CONFIG: 8 pipes, 256 B pipe
++ * interleave, 2 shader engines, 1 KiB DRAM rows. */
++static const uint32_t ac_ps4_tile_modes[32] = {
++   0x00800310, 0x00800b10, 0x00801310, 0x00801b10, 0x00802310, 0x00800308, 0x00801318,
++   0x00802318, 0x00000304, 0x00000308, 0x02000310, 0x02000294, 0x02000318, 0x00400308,
++   0x02400310, 0x024002b0, 0x02400294, 0x02400318, 0x0240032c, 0x0100030c, 0x0100031c,
++   0x010002b4, 0x010002a4, 0x01000328, 0x010002bc, 0x01000320, 0x010002b8, 0, 0, 0, 0, 0,
++};
++static const uint32_t ac_ps4_macrotile_modes[16] = {
++   0xe8, 0xd4, 0xd0, 0xd0, 0x80, 0x40, 0x00, 0x00, 0xec, 0xe8, 0xd4, 0xd0, 0x80, 0x40, 0x00, 0x00,
++};
++#define AC_PS4_GB_ADDR_CONFIG 0x00011003
++#define AC_PS4_MC_ARB_RAMCFG 0x2 /* 16 banks */
++
++static inline void
++ac_ps4_gpu_info(struct amdgpu_gpu_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->asic_id = 0x9920; /* Liverpool */
++   info->chip_external_rev = 0x14; /* Bonaire range: identified as CHIP_BONAIRE (gfx7) */
++   info->family_id = FAMILY_CI;
++   info->ids_flags = AMDGPU_IDS_FLAGS_FUSION;
++   info->max_engine_clk = 800000;
++   info->max_memory_clk = 1375000;
++   info->num_shader_engines = 2;
++   info->num_shader_arrays_per_engine = 1;
++   info->rb_pipes = 8;
++   info->enabled_rb_pipes_mask = 0xff;
++   info->gpu_counter_freq = 100000; /* kHz */
++   info->mc_arb_ramcfg = AC_PS4_MC_ARB_RAMCFG;
++   info->gb_addr_cfg = AC_PS4_GB_ADDR_CONFIG;
++   memcpy(info->gb_tile_mode, ac_ps4_tile_modes, sizeof(ac_ps4_tile_modes));
++   memcpy(info->gb_macro_tile_mode, ac_ps4_macrotile_modes, sizeof(ac_ps4_macrotile_modes));
++   info->cu_bitmap[0][0] = 0x1ff; /* 9 CUs per shader engine, 18 total */
++   info->cu_bitmap[1][0] = 0x1ff;
++   info->vram_type = AMDGPU_VRAM_TYPE_GDDR5;
++   info->vram_bit_width = 256;
++}
++
++/* va_start: the GPU VA window's start (the console reserves it at startup) */
++static inline void
++ac_ps4_dev_info(struct drm_amdgpu_info_device *d, uint64_t va_start)
++{
++   memset(d, 0, sizeof(*d));
++   d->device_id = 0x9920;
++   d->external_rev = 0x14;
++   d->family = FAMILY_CI;
++   d->num_shader_engines = 2;
++   d->num_shader_arrays_per_engine = 1;
++   d->gpu_counter_freq = 100000;
++   d->max_engine_clock = 800000;
++   d->max_memory_clock = 1375000;
++   d->cu_active_number = 18;
++   d->cu_bitmap[0][0] = 0x1ff;
++   d->cu_bitmap[1][0] = 0x1ff;
++   d->enabled_rb_pipes_mask = 0xff;
++   d->num_rb_pipes = 8;
++   d->num_hw_gfx_contexts = 8;
++   d->ids_flags = AMDGPU_IDS_FLAGS_FUSION;
++   d->virtual_address_offset = va_start;
++   d->virtual_address_max = va_start + AC_PS4_VA_SIZE;
++   d->virtual_address_alignment = AC_PS4_PAGE;
++   d->pte_fragment_size = AC_PS4_PAGE;
++   d->gart_page_size = 4096;
++   d->vram_type = AMDGPU_VRAM_TYPE_GDDR5;
++   d->vram_bit_width = 256;
++   d->wave_front_size = 64;
++   d->num_shader_visible_vgprs = 256;
++   d->num_cu_per_sh = 9;
++   d->num_tcc_blocks = 8;
++   d->gs_vgt_table_depth = 32;
++   d->gs_prim_buffer_depth = 1792;
++   d->max_gs_waves_per_vgt = 32;
++}
++
++static inline int
++ac_ps4_query_info(unsigned info_id, unsigned size, void *value, uint64_t va_start)
++{
++   memset(value, 0, size);
++   switch (info_id) {
++   case AMDGPU_INFO_DEV_INFO: {
++      struct drm_amdgpu_info_device d;
++      ac_ps4_dev_info(&d, va_start);
++      memcpy(value, &d, MIN2(size, sizeof(d)));
++      return 0;
++   }
++   case AMDGPU_INFO_MEMORY: {
++      struct drm_amdgpu_memory_info m = {0};
++      m.vram.total_heap_size = m.vram.usable_heap_size = AC_PS4_VRAM_SIZE;
++      m.vram.max_allocation = AC_PS4_VRAM_SIZE;
++      m.cpu_accessible_vram = m.vram;
++      m.gtt.total_heap_size = m.gtt.usable_heap_size = AC_PS4_GTT_SIZE;
++      m.gtt.max_allocation = AC_PS4_GTT_SIZE;
++      memcpy(value, &m, MIN2(size, sizeof(m)));
++      return 0;
++   }
++   case AMDGPU_INFO_VRAM_GTT: {
++      struct drm_amdgpu_info_vram_gtt v = {AC_PS4_VRAM_SIZE, AC_PS4_VRAM_SIZE, AC_PS4_GTT_SIZE};
++      memcpy(value, &v, MIN2(size, sizeof(v)));
++      return 0;
++   }
++   case AMDGPU_INFO_MAX_IBS: {
++      uint32_t *max = value;
++      if (size >= 4)
++         max[AMDGPU_HW_IP_GFX] = 32;
++      return 0;
++   }
++   case AMDGPU_INFO_TIMESTAMP:
++      if (size >= 8)
++         *(uint64_t *)value = os_time_get_nano() / 10; /* 100 MHz */
++      return 0;
++   case AMDGPU_INFO_VRAM_USAGE:
++   case AMDGPU_INFO_GTT_USAGE:
++   case AMDGPU_INFO_VIS_VRAM_USAGE:
++   case AMDGPU_INFO_NUM_EVICTIONS:
++   case AMDGPU_INFO_NUM_BYTES_MOVED:
++   case AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS:
++      return 0;
++   default:
++      return -EINVAL;
++   }
++}
++
++static inline int
++ac_ps4_read_mm_registers(unsigned dword_offset, unsigned count, uint32_t *values)
++{
++   for (unsigned i = 0; i < count; i++) {
++      const unsigned reg = dword_offset + i;
++      if (reg >= 0x2644 && reg < 0x2644 + 32)
++         values[i] = ac_ps4_tile_modes[reg - 0x2644];
++      else if (reg >= 0x2664 && reg < 0x2664 + 16)
++         values[i] = ac_ps4_macrotile_modes[reg - 0x2664];
++      else if (reg == 0x263e)
++         values[i] = AC_PS4_GB_ADDR_CONFIG;
++      else
++         return -EINVAL;
++   }
++   return 0;
++}
++
++/* Only the graphics ring: GNM's compute queues and SDMA aren't exposed. */
++static inline int
++ac_ps4_hw_ip_info(unsigned type, struct drm_amdgpu_info_hw_ip *info)
++{
++   if (type != AMDGPU_HW_IP_GFX)
++      return -EINVAL;
++   memset(info, 0, sizeof(*info));
++   info->hw_ip_version_major = 7;
++   info->hw_ip_version_minor = 0;
++   info->ib_start_alignment = 32;
++   info->ib_size_alignment = 32;
++   info->available_rings = 1;
++   return 0;
++}
++
++static inline void
++ac_ps4_heap_info(uint32_t heap, struct amdgpu_heap_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->heap_size = heap == AMDGPU_GEM_DOMAIN_VRAM ? AC_PS4_VRAM_SIZE : AC_PS4_GTT_SIZE;
++   info->max_allocation = info->heap_size;
++}
++
++#endif /* AC_PS4_INFO_H */
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 852e25d..cda8151 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -757,7 +757,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+       .EXT_buffer_device_address = true,
+       .EXT_calibrated_timestamps = radv_calibrated_timestamps_enabled(pdev),
+       .EXT_color_write_enable = true,
+-#ifdef __PS4__
++#if defined(__PS4__) || defined(AC_PS4_HOST_IDENTITY) /* (the PC build filling the PS4's cache: the PS4's extensions) */
+       .EXT_conditional_rendering = false, /* no SET_PREDICATION (radv_cmd_buffer.c) */
+ #else
+       .EXT_conditional_rendering = true,
+@@ -1066,7 +1066,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
+       .pushDescriptor = true,
+ 
+       /* VK_EXT_conditional_rendering */
+-#ifdef __PS4__
++#if defined(__PS4__) || defined(AC_PS4_HOST_IDENTITY)
+       .conditionalRendering = false,
+ #else
+       .conditionalRendering = true,
 -- 
 2.53.0
 

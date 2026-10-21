@@ -1,8 +1,100 @@
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..ab26782 100644
+index f685d58..c3d9f1b 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
-@@ -1023,14 +1023,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
+@@ -449,6 +449,7 @@ static const char DECODE_HLSL[] =
+ 
+ static void start_compilers(void);                 /* (see "shaders") */
+ static DWORD WINAPI prewarm_main(void *unused);
++static void pack_open(void);
+ 
+ /* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
+  * DXVK test builds of tools/linux/wintest.py). */
+@@ -811,6 +812,7 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
+     if (render_scale != 1.0f)
+         fprintf(stderr, "[gfx] render scale %.3g%s: the game's 1920x1080 drawn at %ux%u\n", render_scale,
+                 display_render_scale() == 0 ? " (auto)" : "", pw, ph);
++    pack_open();
+     start_compilers();
+     /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
+      * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
+@@ -999,6 +1001,75 @@ static void cache_path(const Shader *s, char *path, size_t n) {
+     shader_cache_file(path, n, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
+ }
+ 
++/* The disk cache's files in one ("<cache dir>.pak", the SSBU port's scripts/pack-shadercache.py): a header, a table of
++ * the files' names (FNV-1a of each, sorted) with where each one's bytes are, and the bytes. Where a look-up in a
++ * folder of tens of thousands of files is slow - the PS4's: the renderer waited in stat 30% of its time while a match
++ * started (v00.13), the compiler threads in open 17% - a file of the pack is found in the table and read at its
++ * place. The folder is still asked for what the pack has not (shaders compiled since), and written to. */
++typedef struct { u64 name, offset; u32 size, pad; } PackEntry;
++static PackEntry *pack_index;
++static u32 pack_count;
++static HANDLE pack_file = INVALID_HANDLE_VALUE;
++
++static void pack_open(void) {
++    char path[1100];
++    snprintf(path, sizeof path, "%s.pak", cache_dir());
++    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
++    if (h == INVALID_HANDLE_VALUE) return;
++    struct { char magic[8]; u32 version, count; } head;
++    DWORD got = 0, want;
++    PackEntry *index = NULL;
++    if (ReadFile(h, &head, sizeof head, &got, NULL) && got == sizeof head && !memcmp(head.magic, "SSBUDXBC", 8) && head.version == 1 &&
++        (index = malloc((size_t)head.count * sizeof *index)) &&
++        ReadFile(h, index, want = head.count * (DWORD)sizeof *index, &got, NULL) && got == want) {
++        pack_index = index;
++        pack_count = head.count;
++        pack_file = h;
++        fprintf(stderr, "[gfx] shader cache pack: %u programs (%s)\n", pack_count, path);
++        return;
++    }
++    fprintf(stderr, "[gfx] shader cache pack %s: not one this runtime reads\n", path);
++    free(index);
++    CloseHandle(h);
++}
++
++static const PackEntry *pack_find(const char *path) {
++    if (!pack_count) return NULL;
++    const char *base = strrchr(path, '/');
++    base = base ? base + 1 : path;
++    u64 name = shader_program_hash((const u8 *)base, (u32)strlen(base));
++    u32 lo = 0, hi = pack_count;
++    while (lo < hi) {
++        u32 mid = (lo + hi) / 2;
++        if (pack_index[mid].name < name) lo = mid + 1; else hi = mid;
++    }
++    return lo < pack_count && pack_index[lo].name == name ? &pack_index[lo] : NULL;
++}
++
++/* A cache file's bytes (to free), from the pack or else the folder; NULL if neither has them. */
++static void *cache_read(const char *path, long *size) {
++    const PackEntry *e = pack_find(path);
++    if (e) {
++        void *code = malloc(e->size ? e->size : 1);
++        OVERLAPPED o = {0};
++        o.Offset = (DWORD)e->offset;
++        o.OffsetHigh = (DWORD)(e->offset >> 32);
++        DWORD got = 0;
++        if (code && e->size && ReadFile(pack_file, code, e->size, &got, &o) && got == e->size) { *size = (long)e->size; return code; }
++        free(code);
++    }
++    FILE *f = fopen(path, "rb");
++    if (!f) return NULL;
++    fseek(f, 0, SEEK_END);
++    long n = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    void *code = n > 0 ? malloc(n) : NULL;
++    if (code && fread(code, 1, n, f) != (size_t)n) { free(code); code = NULL; }
++    fclose(f);
++    if (code) *size = n;
++    return code;
++}
++
+ /* A file the ahead-of-time compiler wrote (dated 2001), now used by the game: dated now, so the
+  * next start's prewarm makes it. */
+ static void cache_touch(const char *path) {
+@@ -1023,14 +1094,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
   * device, which compiles right here (its object is not needed: the rendering device finds the
   * GPU code in the driver's cache - measured 3.5 ms of its time a shader instead of 190 ms),
   * then the object the draws use */
@@ -26,6 +118,70 @@ index f685d58..ab26782 100644
      return ok;
  }
  
+@@ -1107,16 +1187,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+         char path[1200];
+         cache_path(s, path, sizeof path);
+         me->step = STEP_CACHE;
+-        FILE *f = fopen(path, "rb");
+-        if (f) {
+-            fseek(f, 0, SEEK_END);
+-            long n = ftell(f);
+-            fseek(f, 0, SEEK_SET);
+-            void *code = n > 0 ? malloc(n) : NULL;
+-            if (code && fread(code, 1, n, f) == (size_t)n && create_noted(me, s, code, n)) obj = s->obj;
+-            fclose(f);
+-            free(code);
+-        }
++        long n = 0;
++        void *code = cache_read(path, &n);
++        if (code && create_noted(me, s, code, n)) obj = s->obj;
++        free(code);
+     }
+     AcquireSRWLockExclusive(&prewarm_lock);
+     if (go && p->state == PW_LOADING) {
+@@ -1137,23 +1211,22 @@ static LONG make_ready(struct Compiler *me, Shader *s) {
+     char path[1200];
+     cache_path(s, path, sizeof path);
+     me->step = STEP_CACHE;
+-    FILE *f = s->cached ? fopen(path, "rb") : NULL;
+-    if (f) {   /* compiled in an earlier run */
+-        fseek(f, 0, SEEK_END);
+-        long n = ftell(f);
+-        fseek(f, 0, SEEK_SET);
+-        void *code = n > 0 ? malloc(n) : NULL;
+-        int ok = code && fread(code, 1, n, f) == (size_t)n && create_noted(me, s, code, n);
+-        fclose(f);
+-        free(code);
+-        if (ok) { cache_touch(path); return 1; }
++    long n = 0;
++    void *cached = s->cached ? cache_read(path, &n) : NULL;
++    if (cached) {   /* compiled in an earlier run */
++        int ok = create_noted(me, s, cached, n);
++        free(cached);
++        if (ok) {
++            if (!pack_find(path)) cache_touch(path);   /* (the pack's are not dated: the prewarm reads the folder) */
++            return 1;
++        }
+     }
+     me->step = STEP_FXC;
+     ID3DBlob *code = NULL, *errors = NULL;
+     HRESULT hr = shader_cache_compile(s->hlsl, s->name, s->stage, &code, &errors);
+     LONG state = 2;
+     if (SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code))) {
+-        f = fopen(path, "wb");
++        FILE *f = fopen(path, "wb");
+         if (f) { fwrite(ID3D10Blob_GetBufferPointer(code), 1, ID3D10Blob_GetBufferSize(code), f); fclose(f); }
+         state = 1;
+     } else {
+@@ -1475,7 +1548,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+     }
+     char path[1200];
+     cache_path(s, path, sizeof path);
+-    s->cached = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++    s->cached = pack_find(path) || GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+     enqueue_shader(s);
+     /* a compute program that was compiled before is waited for (a few ms): a skipped launch
+      * leaves its outputs (skinned vertices) unwritten for a frame */
 diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
 index e822de7..e498d1a 100644
 --- a/runtime/hle_pad.c
