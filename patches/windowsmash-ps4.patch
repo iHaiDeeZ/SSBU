@@ -1,24 +1,207 @@
+diff --git a/runtime/display.h b/runtime/display.h
+index 4a4d0e2..72f666e 100644
+--- a/runtime/display.h
++++ b/runtime/display.h
+@@ -34,6 +34,12 @@ const char *display_gpu(void);          /* the graphics card to use: "auto", or
+  * (0.5-4; SSBU_RENDER_SCALE). 0 = auto: as many as the picture has pixels in the window at the
+  * start (1440p: 1.33), at least 1. */
+ float display_render_scale(void);
++/* upscaler: how a picture smaller than its place (render_scale below 1) is stretched to it - bilinear, or
++ * fsr: AMD FidelityFX Super Resolution 1.0 (its edge-adaptive upscale, then its sharpening, fsr_sharpness
++ * stops below the strongest: 0-2). Both read at each present (the menu changes them while playing). */
++enum { UPSCALE_BILINEAR, UPSCALE_FSR };
++int display_upscaler(void);
++float display_fsr_sharpness(void);
+ /* The renderer says whether the swap chain can tear (for VRR); the flags each Present gets. */
+ void display_set_tearing(int supported);
+ unsigned display_present_flags(void);
+@@ -42,7 +48,7 @@ void display_wait_tick(void);
+ 
+ /* The settings menu (gpu_menu.c), which saves display.ini itself: the settings in effect, and
+  * changes that take effect now. The window's size and the graphics card count at the next start. */
+-typedef struct DisplaySettings { int mode, width, height, latency, hide_cursor, overlay; Pacing pacing; char gpu[64]; float render_scale; } DisplaySettings;
++typedef struct DisplaySettings { int mode, width, height, latency, hide_cursor, overlay; Pacing pacing; char gpu[64]; float render_scale; int upscaler; float fsr_sharpness; } DisplaySettings;
+ void display_settings(DisplaySettings *out);
+ const char *display_ini_path(void);
+ int display_overlay(void);                /* overlay = 1: the frame-rate overlay shows from the start */
+@@ -53,3 +59,5 @@ void display_set_hide_cursor(int on);
+ void display_set_latency(int frames);
+ int display_take_latency(void);           /* the renderer, at a present: a new latency, or 0 */
+ void display_set_render_scale(float scale);   /* (shown by the menu; the renderer takes it at the next start) */
++void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
++void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..51027cd 100644
+index f685d58..6a391ac 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
-@@ -449,6 +449,7 @@ static const char DECODE_HLSL[] =
+@@ -48,6 +48,14 @@ static u32 final_w, final_h;
+ static ID3D11VertexShader *blit_vs;
+ static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps, *decode_ps, *down_ps;
+ static ID3D11Buffer *down_cb;
++/* FSR 1 (display.ini upscaler = fsr): a picture smaller than its place (render scale below 1) upscaled into
++ * upscale_tex, its place's size, then sharpened into the window (see FSR_HLSL) */
++static ID3D11PixelShader *easu_ps, *rcas_ps;
++static ID3D11Buffer *fsr_cb;
++static ID3D11Texture2D *upscale_tex;
++static ID3D11RenderTargetView *upscale_rtv;
++static ID3D11ShaderResourceView *upscale_srv;
++static u32 upscale_w, upscale_h;
+ static ID3D11SamplerState *linear_sampler;
+ static CRITICAL_SECTION lock;
+ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+@@ -410,6 +418,23 @@ static int make_final(u32 w, u32 h) {
+     return 1;
+ }
  
++/* FSR's upscaled picture at w x h (the picture's place in the window), made again when that changes */
++static int make_upscale(u32 w, u32 h) {
++    if (upscale_tex && upscale_w == w && upscale_h == h) return 1;
++    ID3D11Texture2D *tex;
++    ID3D11RenderTargetView *rtv;
++    D3D11_TEXTURE2D_DESC td = {w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
++                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
++    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tex))) return 0;
++    if (FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, NULL, &rtv))) { ID3D11Texture2D_Release(tex); return 0; }
++    ID3D11ShaderResourceView *srv = make_srv(tex, DXGI_FORMAT_R8G8B8A8_UNORM);
++    if (!srv) { ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(tex); return 0; }
++    if (upscale_tex) { bury(upscale_rtv); bury(upscale_srv); bury(upscale_tex); }
++    upscale_tex = tex; upscale_rtv = rtv; upscale_srv = srv;
++    upscale_w = w; upscale_h = h;
++    return 1;
++}
++
+ static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *target) {
+     ID3DBlob *code = NULL, *errors = NULL;
+     if (FAILED(D3DCompile(src, strlen(src), NULL, NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors))) {
+@@ -420,6 +445,20 @@ static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *ta
+     return code;
+ }
+ 
++/* A pixel shader of an optional feature: NULL (and the compiler's complaint in the log) where it does not compile. */
++static ID3D11PixelShader *try_pixel_shader(const char *src, const char *entry) {
++    ID3DBlob *code = NULL, *errors = NULL;
++    ID3D11PixelShader *ps = NULL;
++    if (FAILED(D3DCompile(src, strlen(src), NULL, NULL, NULL, entry, "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors)) ||
++        FAILED(ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &ps))) {
++        fprintf(stderr, "[gfx] shader %s did not compile: %s\n", entry, errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "(the driver refused it)");
++        ps = NULL;
++    }
++    if (code) ID3D10Blob_Release(code);
++    if (errors) ID3D10Blob_Release(errors);
++    return ps;
++}
++
+ static const char BLIT_HLSL[] =
+     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+     "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+@@ -447,8 +486,89 @@ static const char DECODE_HLSL[] =
+     "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+     "float4 main(V i) : SV_Target { return src.Load(int4(int2(i.pos.xy), 0, 0)); }\n";
+ 
++/* FSR 1 - AMD FidelityFX Super Resolution 1.0 (ffx_fsr1.h, MIT license): its edge-adaptive upscale (EASU) and
++ * its robust contrast-adaptive sharpening (RCAS), the 32-bit float paths, with a texel load for each of EASU's
++ * twelve taps in place of its gathers, and RCAS's limits kept from dividing by zero. Both work on the picture's
++ * bytes as they are: sRGB-encoded, the perceptual space FSR is made for. */
++static const char FSR_HLSL[] =
++    "Texture2D<float4> fsr_in : register(t0);\n"
++    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
++    /* easu0: the output pixel to input position scale xy and offset zw (FsrEasuCon's con0); easu_max: the
++     * input's last texel. rcas0.x: the sharpening, exp2(-stops); rcas_max: the upscaled picture's last texel
++     * xy, and its place's origin in the window zw */
++    "cbuffer F : register(b4) { float4 easu0; int4 easu_max; float4 rcas0; int4 rcas_max; };\n"
++    "float3 fsr_load(int2 p, int2 last) { return fsr_in.Load(int3(clamp(p, int2(0, 0), last), 0)).rgb; }\n"
++    "float rcp_lo(float a) { return asfloat(0x7ef07ebbu - asuint(a)); }\n"
++    "float rsq_lo(float a) { return asfloat(0x5f347d74u - (asuint(a) >> 1)); }\n"
++    "float rcp_med(float a) { float b = asfloat(0x7ef19fffu - asuint(a)); return b * (-b * a + 2.0); }\n"
++    "float luma2(float3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }\n"
++    "void easu_set(inout float2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE) {\n"
++    "  float lenX = rcp_lo(max(abs(lD - lC), abs(lC - lB))); float dirX = lD - lB;\n"
++    "  dir.x += dirX * w; lenX = saturate(abs(dirX) * lenX); len += lenX * lenX * w;\n"
++    "  float lenY = rcp_lo(max(abs(lE - lC), abs(lC - lA))); float dirY = lE - lA;\n"
++    "  dir.y += dirY * w; lenY = saturate(abs(dirY) * lenY); len += lenY * lenY * w; }\n"
++    "void easu_tap(inout float3 aC, inout float aW, float2 off, float2 dir, float2 len, float lob, float clp, float3 c) {\n"
++    "  float2 v = float2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len;\n"
++    "  float d2 = min(v.x * v.x + v.y * v.y, clp);\n"
++    "  float wB = 2.0 / 5.0 * d2 - 1.0, wA = lob * d2 - 1.0;\n"
++    "  wB *= wB; wA *= wA; wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);\n"
++    "  float w = wB * wA; aC += c * w; aW += w; }\n"
++    /* EASU: the twelve texels around the output pixel's place in the picture -   b c
++     * the four nearest (f g j k) give the edge's direction and length,          e f g h
++     * the twelve a Lanczos-like kernel stretched along it                         i j k l
++     *                                                                               n o */
++    "float4 easu(V i) : SV_Target {\n"
++    "  float2 pp = floor(i.pos.xy) * easu0.xy + easu0.zw, fp = floor(pp); pp -= fp;\n"
++    "  int2 f = int2(fp), m = easu_max.xy;\n"
++    "  float3 b = fsr_load(f + int2(0, -1), m), c = fsr_load(f + int2(1, -1), m);\n"
++    "  float3 e = fsr_load(f + int2(-1, 0), m), F = fsr_load(f, m), g = fsr_load(f + int2(1, 0), m), h = fsr_load(f + int2(2, 0), m);\n"
++    "  float3 I = fsr_load(f + int2(-1, 1), m), j = fsr_load(f + int2(0, 1), m), k = fsr_load(f + int2(1, 1), m), l = fsr_load(f + int2(2, 1), m);\n"
++    "  float3 n = fsr_load(f + int2(0, 2), m), o = fsr_load(f + int2(1, 2), m);\n"
++    "  float bL = luma2(b), cL = luma2(c), eL = luma2(e), fL = luma2(F), gL = luma2(g), hL = luma2(h);\n"
++    "  float iL = luma2(I), jL = luma2(j), kL = luma2(k), lL = luma2(l), nL = luma2(n), oL = luma2(o);\n"
++    "  float2 dir = 0; float len = 0;\n"
++    "  easu_set(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);\n"
++    "  easu_set(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);\n"
++    "  easu_set(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);\n"
++    "  easu_set(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);\n"
++    "  float dirR = dir.x * dir.x + dir.y * dir.y; bool zro = dirR < 1.0 / 32768.0;\n"
++    "  dirR = zro ? 1.0 : rsq_lo(dirR); dir.x = zro ? 1.0 : dir.x; dir *= dirR;\n"
++    "  len = len * 0.5; len *= len;\n"
++    "  float stretch = (dir.x * dir.x + dir.y * dir.y) * rcp_lo(max(abs(dir.x), abs(dir.y)));\n"
++    "  float2 len2 = float2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);\n"
++    "  float lob = 0.5 + (1.0 / 4.0 - 0.04 - 0.5) * len, clp = rcp_lo(lob);\n"
++    "  float3 aC = 0; float aW = 0;\n"
++    "  easu_tap(aC, aW, float2(0, -1) - pp, dir, len2, lob, clp, b);\n"
++    "  easu_tap(aC, aW, float2(1, -1) - pp, dir, len2, lob, clp, c);\n"
++    "  easu_tap(aC, aW, float2(-1, 1) - pp, dir, len2, lob, clp, I);\n"
++    "  easu_tap(aC, aW, float2(0, 1) - pp, dir, len2, lob, clp, j);\n"
++    "  easu_tap(aC, aW, float2(0, 0) - pp, dir, len2, lob, clp, F);\n"
++    "  easu_tap(aC, aW, float2(-1, 0) - pp, dir, len2, lob, clp, e);\n"
++    "  easu_tap(aC, aW, float2(1, 1) - pp, dir, len2, lob, clp, k);\n"
++    "  easu_tap(aC, aW, float2(2, 1) - pp, dir, len2, lob, clp, l);\n"
++    "  easu_tap(aC, aW, float2(2, 0) - pp, dir, len2, lob, clp, h);\n"
++    "  easu_tap(aC, aW, float2(1, 0) - pp, dir, len2, lob, clp, g);\n"
++    "  easu_tap(aC, aW, float2(1, 2) - pp, dir, len2, lob, clp, o);\n"
++    "  easu_tap(aC, aW, float2(0, 2) - pp, dir, len2, lob, clp, n);\n"
++    "  float3 mn = min(min(F, g), min(j, k)), mx = max(max(F, g), max(j, k));\n"
++    "  return float4(min(mx, max(mn, aC / aW)), 1); }\n"
++    /* RCAS: the cross of five pixels around each; the sharpening lobe as strong as it can be without
++     * clipping, at most FSR_RCAS_LIMIT (no denoise) */
++    "float4 rcas(V i) : SV_Target {\n"
++    "  int2 p = int2(i.pos.xy) - rcas_max.zw, m = rcas_max.xy;\n"
++    "  float3 b = fsr_load(p + int2(0, -1), m), d = fsr_load(p + int2(-1, 0), m), e = fsr_load(p, m);\n"
++    "  float3 f = fsr_load(p + int2(1, 0), m), h = fsr_load(p + int2(0, 1), m);\n"
++    "  float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
++    "  float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1.0 / 65536.0);\n"
++    "  float3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, -1.0 / 65536.0);\n"
++    "  float3 lobe3 = max(-hitMin, hitMax);\n"
++    "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0.0)) * rcas0.x;\n"
++    "  float rcpL = rcp_med(4.0 * lobe + 1.0);\n"
++    "  return float4((lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL, 1); }\n";
++
  static void start_compilers(void);                 /* (see "shaders") */
  static DWORD WINAPI prewarm_main(void *unused);
 +static void pack_open(void);
  
  /* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
   * DXVK test builds of tools/linux/wintest.py). */
-@@ -811,6 +812,7 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
+@@ -811,6 +931,16 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      if (render_scale != 1.0f)
          fprintf(stderr, "[gfx] render scale %.3g%s: the game's 1920x1080 drawn at %ux%u\n", render_scale,
                  display_render_scale() == 0 ? " (auto)" : "", pw, ph);
++    if (render_scale < 1.0f) {   /* FSR 1, for the picture smaller than the window (display.ini upscaler) */
++        u64 t0 = rt_clock_ns();
++        easu_ps = try_pixel_shader(FSR_HLSL, "easu");
++        rcas_ps = easu_ps ? try_pixel_shader(FSR_HLSL, "rcas") : NULL;
++        D3D11_BUFFER_DESC fcb = {64, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
++        if (rcas_ps && FAILED(ID3D11Device_CreateBuffer(dev, &fcb, NULL, &fsr_cb))) fsr_cb = NULL;
++        fprintf(stderr, "[gfx] FSR 1 %s (%.1f s); upscaler now %s\n", fsr_cb ? "ready" : "not available: stretched bilinear",
++                (rt_clock_ns() - t0) / 1e9, display_upscaler() == UPSCALE_FSR && fsr_cb ? "FSR 1" : "bilinear");
++    }
 +    pack_open();
      start_compilers();
      /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
       * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
-@@ -999,6 +1001,105 @@ static void cache_path(const Shader *s, char *path, size_t n) {
+@@ -999,6 +1129,105 @@ static void cache_path(const Shader *s, char *path, size_t n) {
      shader_cache_file(path, n, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
  }
  
@@ -124,7 +307,7 @@ index f685d58..51027cd 100644
  /* A file the ahead-of-time compiler wrote (dated 2001), now used by the game: dated now, so the
   * next start's prewarm makes it. */
  static void cache_touch(const char *path) {
-@@ -1023,14 +1124,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
+@@ -1023,14 +1252,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
   * device, which compiles right here (its object is not needed: the rendering device finds the
   * GPU code in the driver's cache - measured 3.5 ms of its time a shader instead of 190 ms),
   * then the object the draws use */
@@ -148,7 +331,7 @@ index f685d58..51027cd 100644
      return ok;
  }
  
-@@ -1107,16 +1217,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+@@ -1107,16 +1345,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
          char path[1200];
          cache_path(s, path, sizeof path);
          me->step = STEP_CACHE;
@@ -169,7 +352,7 @@ index f685d58..51027cd 100644
      }
      AcquireSRWLockExclusive(&prewarm_lock);
      if (go && p->state == PW_LOADING) {
-@@ -1135,26 +1239,32 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+@@ -1135,26 +1367,32 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
  /* (on a compiler thread) the shader's GPU code: 1 ready, 2 failed */
  static LONG make_ready(struct Compiler *me, Shader *s) {
      char path[1200];
@@ -214,7 +397,7 @@ index f685d58..51027cd 100644
          state = 1;
      } else {
          fprintf(stderr, "[gfx] shader %s failed to compile:\n%.2000s\n", s->name,
-@@ -1474,8 +1584,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+@@ -1474,8 +1712,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
          return s;
      }
      char path[1200];
@@ -224,6 +407,371 @@ index f685d58..51027cd 100644
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
       * leaves its outputs (skinned vertices) unwritten for a frame */
+@@ -4346,6 +4583,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+         ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+         ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
+         ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
++    } else if ((final_w < fit_w || final_h < fit_h) && display_upscaler() == UPSCALE_FSR && fsr_cb && make_upscale(fit_w, fit_h) &&
++               SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &dm))) {
++        /* smaller than its place, FSR 1: upscaled to the place's size (EASU), then sharpened into the window (RCAS) */
++        float sx = (float)final_w / (float)fit_w, sy = (float)final_h / (float)fit_h;
++        struct { float easu0[4]; int easu_max[4]; float rcas0[4]; int rcas_max[4]; } k = {
++            {sx, sy, 0.5f * sx - 0.5f, 0.5f * sy - 0.5f}, {(int)final_w - 1, (int)final_h - 1, 0, 0},
++            {exp2f(-display_fsr_sharpness()), 0, 0, 0}, {(int)fit_w - 1, (int)fit_h - 1, (int)fit_x, (int)fit_y}};
++        memcpy(dm.pData, &k, sizeof k);
++        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)fsr_cb, 0);
++        D3D11_VIEWPORT uvp = {0, 0, (float)fit_w, (float)fit_h, 0, 1};
++        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 4, 1, &fsr_cb);
++        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &upscale_rtv, NULL);
++        ID3D11DeviceContext_RSSetViewports(ctx, 1, &uvp);
++        ID3D11DeviceContext_PSSetShader(ctx, easu_ps, NULL, 0);
++        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
++        ID3D11DeviceContext_Draw(ctx, 3, 0);
++        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
++        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
++        ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
++        ID3D11DeviceContext_PSSetShader(ctx, rcas_ps, NULL, 0);
++        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &upscale_srv);
++        ID3D11DeviceContext_Draw(ctx, 3, 0);
++        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
++        ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
+     } else {   /* as big as its place or smaller: drawn bilinear */
+         ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+         ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+@@ -4453,12 +4714,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+                  profile_running() ? "  (profiling...)" : "");
+         char net[512];
+         net_status(net, sizeof net);
++#ifdef __ORBIS__   /* (no keyboard: the pad's L3+R3, runtime/ps4/pad.c) */
++        snprintf(hint, sizeof hint, "L3+R3 settings%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
++#else
+         snprintf(hint, sizeof hint, "F2 details  Esc settings%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
++#endif
+                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
+         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
+         if (render_scale != 1.0f) {
+             size_t l = strlen(detail);
+-            snprintf(detail + l, sizeof detail - l, "\nrender scale %.3g: picture %ux%u", render_scale, final_w, final_h);
++            snprintf(detail + l, sizeof detail - l, "\nrender scale %.3g: picture %ux%u%s", render_scale, final_w, final_h,
++                     render_scale < 1.0f ? (display_upscaler() == UPSCALE_FSR && fsr_cb ? ", FSR 1" : ", bilinear") : "");
+         }
+         char pads[256];
+         pad_describe(pads, sizeof pads);
+diff --git a/runtime/gpu_display.c b/runtime/gpu_display.c
+index 2cafd68..6150b41 100644
+--- a/runtime/gpu_display.c
++++ b/runtime/gpu_display.c
+@@ -50,7 +50,13 @@ static struct {
+     int loaded;
+     char gpu[64];
+     float render_scale;   /* 0: auto */
+-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f};
++    volatile int upscaler;          /* UPSCALE_* */
++    volatile float fsr_sharpness;   /* stops below FSR's strongest sharpening */
++#ifdef __ORBIS__   /* (the PS4: a smaller picture is how the frame rate is raised there - FSR keeps it sharp) */
++} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, UPSCALE_FSR, 0.2f};
++#else
++} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, UPSCALE_BILINEAR, 0.2f};
++#endif
+ 
+ static const char DEFAULT_INI[] =
+     "; display.ini: the game's window and the pacing of its frames. Read when the game starts; the\n"
+@@ -123,6 +129,15 @@ static const char DEFAULT_INI[] =
+     ";   auto: as many pixels as the picture has in the window when the game starts (1.33 on a 2560x1440\n"
+     ";   monitor with window = borderless), at least 1. A bigger picture than the window is shrunk to fit.\n"
+     "render_scale = 1\n"
++    "; upscaler = fsr | bilinear: how a picture smaller than the window (render_scale below 1) is stretched\n"
++    ";   to it. fsr: AMD FidelityFX Super Resolution 1.0, edge-adaptive and then sharpened; bilinear: plain.\n"
++#ifdef __ORBIS__
++    "upscaler = fsr\n"
++#else
++    "upscaler = bilinear\n"
++#endif
++    "; fsr_sharpness = 0 to 2: FSR's sharpening, in stops below its strongest (0: the sharpest, 2: hardly any).\n"
++    "fsr_sharpness = 0.2\n"
+ #endif
+ #ifdef _WIN32
+     "\n"
+@@ -156,6 +171,19 @@ static void parse_render_scale(const char *v) {
+     else { fprintf(stderr, "[display] render_scale is auto or a number from 0.5 to 4, not '%s': 1 it is\n", v); cfg.render_scale = 1; }
+ }
+ 
++static void parse_upscaler(const char *v) {
++    if (!_stricmp(v, "fsr") || !_stricmp(v, "fsr1")) cfg.upscaler = UPSCALE_FSR;
++    else if (!_stricmp(v, "bilinear")) cfg.upscaler = UPSCALE_BILINEAR;
++    else fprintf(stderr, "[display] upscaler is fsr or bilinear, not '%s'\n", v);
++}
++
++static void parse_fsr_sharpness(const char *v) {
++    char *end;
++    double x = strtod(v, &end);
++    if (end != v && x >= 0 && x <= 2) cfg.fsr_sharpness = (float)x;
++    else fprintf(stderr, "[display] fsr_sharpness is a number from 0 to 2, not '%s'\n", v);
++}
++
+ static char *trim(char *s) {
+     while (*s == ' ' || *s == '\t') s++;
+     char *e = s + strlen(s);
+@@ -193,6 +221,8 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+         else if (!_stricmp(key, "overlay")) cfg.overlay = atoi(value) != 0;
+         else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
+         else if (!_stricmp(key, "render_scale")) parse_render_scale(value);
++        else if (!_stricmp(key, "upscaler")) parse_upscaler(value);
++        else if (!_stricmp(key, "fsr_sharpness")) parse_fsr_sharpness(value);
+         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
+     }
+     if (f) fclose(f);
+@@ -201,6 +231,8 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
+     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
+     if ((env = getenv("SSBU_RENDER_SCALE")) && *env) parse_render_scale(env);
++    if ((env = getenv("SSBU_UPSCALER")) && *env) parse_upscaler(env);
++    if ((env = getenv("SSBU_FSR_SHARPNESS")) && *env) parse_fsr_sharpness(env);
+     if (cfg.width < 320) cfg.width = 320;
+     if (cfg.height < 180) cfg.height = 180;
+     if (cfg.latency < 1) cfg.latency = 1;
+@@ -218,6 +250,10 @@ int display_latency(void) { load(); return cfg.latency; }
+ Pacing display_pacing(void) { load(); return cfg.pacing; }
+ const char *display_gpu(void) { load(); return cfg.gpu; }
+ float display_render_scale(void) { load(); return cfg.render_scale; }
++int display_upscaler(void) { load(); return cfg.upscaler; }
++float display_fsr_sharpness(void) { load(); return cfg.fsr_sharpness; }
++void display_set_upscaler(int upscaler) { load(); cfg.upscaler = upscaler; }
++void display_set_fsr_sharpness(float stops) { load(); cfg.fsr_sharpness = stops; }
+ 
+ /* (the settings menu) the render scale it saved: shown from now on, the renderer's own counts
+  * only at the next start */
+@@ -231,7 +267,8 @@ static volatile LONG asked_mode = -1, asked_latency;
+ 
+ void display_settings(DisplaySettings *out) {
+     load();
+-    *out = (DisplaySettings){cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "", render_scale_saved ? saved_render_scale : cfg.render_scale};
++    *out = (DisplaySettings){cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "",
++                             render_scale_saved ? saved_render_scale : cfg.render_scale, cfg.upscaler, cfg.fsr_sharpness};
+     snprintf(out->gpu, sizeof out->gpu, "%s", cfg.gpu);
+ }
+ 
+diff --git a/runtime/gpu_menu.c b/runtime/gpu_menu.c
+index 836945b..4f9984a 100644
+--- a/runtime/gpu_menu.c
++++ b/runtime/gpu_menu.c
+@@ -12,11 +12,13 @@
+  * UP DOWN LEFT RIGHT ENTER ESC TAB BKSP DEL, SHOT (a screenshot with the menu), or types
+  * =<text>. */
+ #define _CRT_SECURE_NO_WARNINGS
++#include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ #include "host.h"
++#include "debug_profile.h"
+ #include "display.h"
+ #include "gpu_menu.h"
+ #include "gpu_overlay.h"
+@@ -62,6 +64,10 @@ static void push(LONG v) {
+ void menu_key(int key) { push(key); }
+ void menu_char(unsigned ch) { if (ch >= 32 && ch < 127) push((LONG)(0x10000 | ch)); }
+ 
++/* (the PS4's pads, runtime/ps4/pad.c: L3+R3) open or close it at the next frame */
++static volatile LONG toggle_asked;
++void menu_request_toggle(void) { InterlockedExchange(&toggle_asked, 1); }
++
+ /* ---- what can be pressed ---------------------------------------------------------------- */
+ enum {   /* (from keys, pads or the test script) */
+     EV_UP = 1, EV_DOWN, EV_LEFT, EV_RIGHT, EV_ENTER, EV_A, EV_BKSP, EV_B, EV_DEL, EV_NEXT, EV_PREV, EV_DONE, EV_ESC, EV_CHAR
+@@ -69,11 +75,15 @@ enum {   /* (from keys, pads or the test script) */
+ 
+ /* ---- the rows of a page ------------------------------------------------------------------ */
+ enum { P_DISPLAY, P_PADS, P_ONLINE, P_GAME, P_REMAP };
++#ifdef __ORBIS__   /* (the PS4: the first page is its graphics - resolution, FSR - not a window's) */
++static const char *const PAGE_NAMES[4] = {"Graphics", "Controllers", "Online", "Game"};
++#else
+ static const char *const PAGE_NAMES[4] = {"Display", "Controllers", "Online", "Game"};
++#endif
+ enum { K_INFO, K_CHOICE, K_ACTION, K_TEXT };
+ enum { W_NONE, W_NOW, W_RESTART };
+ enum {
+-    R_NONE, R_WINDOW, R_PACING, R_LATENCY, R_CURSOR, R_OVERLAY, R_SIZE, R_SCALE, R_GPU,
++    R_NONE, R_WINDOW, R_PACING, R_LATENCY, R_CURSOR, R_OVERLAY, R_SIZE, R_SCALE, R_GPU, R_UPSCALER, R_SHARPNESS, R_PROFILE,
+     R_PAD, R_PAD_PLAYER, R_PAD_LAYOUT, R_PAD_DEADZONE, R_PAD_RUMBLE, R_PAD_TRIGGER, R_PAD_REMAP, R_PAD_TEST, R_PAD_RESET,
+     R_RUMBLE, R_KEYBOARD, R_BACKGROUND, R_PADS_FILE,
+     R_NET_STATUS, R_NET_MODE, R_NET_CODE, R_NET_SERVER, R_NET_NAME, R_NET_DIRECT,
+@@ -181,7 +191,11 @@ static void close_menu(void) {
+ static void changed(int when) {
+     if (when == W_RESTART && !restart_pending) {
+         restart_pending = 1;
++#ifdef __ORBIS__
++        menu_toast("Saved: takes effect when the game starts again (Restart the game, below)");
++#else
+         menu_toast("Saved: takes effect when the game starts again (Game > Restart)");
++#endif
+     }
+ }
+ 
+@@ -228,6 +242,18 @@ static void note_env(Row *r, const char *var) {
+ }
+ 
+ static const int SIZES[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
++/* The PS4's resolutions (render_scale: the game's 1920x1080 times these) and FSR's sharpness (stops below its strongest) */
++static const float PS4_SCALES[] = {1.0f, 0.85f, 0.75f, 0.6667f, 0.5f};
++static const char *const PS4_SCALE_VALUES[] = {"1", "0.85", "0.75", "0.6667", "0.5"};
++static const char *const PS4_SCALE_NAMES[] = {"100% (1920 x 1080)", "85% (1632 x 918)", "75% (1440 x 810)", "67% (1280 x 720)", "50% (960 x 540)"};
++static const float SHARPNESS[] = {0.0f, 0.2f, 0.5f, 1.0f};
++static const char *const SHARPNESS_VALUES[] = {"0", "0.2", "0.5", "1"};
++static const char *const SHARPNESS_NAMES[] = {"maximum", "high", "medium", "low"};
++static int nearest(const float *v, int n, float x) {
++    int best = 0;
++    for (int i = 1; i < n; i++) if (fabsf(v[i] - x) < fabsf(v[best] - x)) best = i;
++    return best;
++}
+ static const int REMAP_ORDER[16] = {0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 4, 5, 13, 15, 12, 14};   /* A B X Y L R ZL ZR + - sticks, d-pad */
+ 
+ static void build(void) {
+@@ -238,6 +264,26 @@ static void build(void) {
+     PadInfo *pad = pad_slot >= 0 && pads[pad_slot].connected ? &pads[pad_slot] : NULL;
+     switch (page) {
+     case P_DISPLAY:
++#ifdef __ORBIS__   /* (the PS4: no window, one screen - its resolution, FSR 1, the frame rate) */
++        r = add(R_SCALE, K_CHOICE, W_RESTART, "Resolution",
++                "The size the game draws at: lower is less work for the PS4's graphics chip in busy scenes, and the upscaling below stretches it to the screen. Takes effect when the game starts again (Restart, below).");
++        snprintf(r->value, sizeof r->value, "%s", PS4_SCALE_NAMES[nearest(PS4_SCALES, 5, ds.render_scale > 0 ? ds.render_scale : 1)]);
++        note_env(r, "SSBU_RENDER_SCALE");
++        r = add(R_UPSCALER, K_CHOICE, W_NOW, "Upscaling",
++                "How a resolution below 100% reaches the screen. FSR 1 (AMD FidelityFX Super Resolution): edges kept clean, then sharpened. Bilinear: a plain stretch, softer.");
++        snprintf(r->value, sizeof r->value, "%s", ds.upscaler == UPSCALE_FSR ? "FSR 1" : "bilinear");
++        note_env(r, "SSBU_UPSCALER");
++        r = add(R_SHARPNESS, K_CHOICE, W_NOW, "FSR sharpness", "How strongly FSR 1 sharpens the stretched picture.");
++        snprintf(r->value, sizeof r->value, "%s", SHARPNESS_NAMES[nearest(SHARPNESS, 4, ds.fsr_sharpness)]);
++        note_env(r, "SSBU_FSR_SHARPNESS");
++        r = add(R_OVERLAY, K_CHOICE, W_NOW, "Frame rate in the corner", "The frame rate and a graph of frame times.");
++        snprintf(r->value, sizeof r->value, "%s", on_off(overlay_on ? *overlay_on : ds.overlay));
++        note_env(r, "SSBU_OVERLAY");
++        add(R_PROFILE, K_ACTION, W_NONE, "Save a profile (10 s)",
++            "Closes this menu and records for 10 seconds where the time goes (/data/SSBU/profiles), for fixing slowdowns: keep playing meanwhile.");
++        add(R_RESTART, K_ACTION, W_NONE, restart_pending ? "Restart now" : "Restart the game", "Starts the game again, at the resolution chosen. A match in progress is lost.");
++        break;
++#endif
+         r = add(R_WINDOW, K_CHOICE, W_NOW, "Window", "Windowed: a normal window. Borderless: covering the monitor. Full screen: borderless and always on top. F11 switches too.");
+         snprintf(r->value, sizeof r->value, "%s", ds.mode == DISPLAY_BORDERLESS ? "borderless" : ds.mode == DISPLAY_FULLSCREEN ? "full screen" : "windowed");
+         note_env(r, "SSBU_WINDOW");
+@@ -355,8 +401,12 @@ static void build(void) {
+     case P_GAME:
+         add(R_RESTART, K_ACTION, W_NONE, "Restart the game", "Starts the game again (for the settings marked 'next start'). A match in progress is lost.");
+         add(R_QUIT, K_ACTION, W_NONE, "Quit the game", "Closes the game. A match in progress is lost.");
++#ifdef __ORBIS__
++        static const char *const KEYS[][2] = {{"L3 + R3", "this menu (or hold Options and the touch pad for a second)"}};
++#else
+         static const char *const KEYS[][2] = {{"Esc / Home button", "this menu (or hold - and + for a second)"}, {"F1", "frame rate on / off"},
+                                                {"F2", "details"}, {"F3", "screenshot (screenshots folder)"}, {"F11, Alt+Enter", "full screen"}};
++#endif
+         for (u32 i = 0; i < sizeof KEYS / sizeof *KEYS; i++) {
+             r = add(R_NONE, K_INFO, W_NONE, KEYS[i][0], "Keys that work while playing.");
+             snprintf(r->value, sizeof r->value, "%s", KEYS[i][1]);
+@@ -442,6 +492,12 @@ static void change(const Row *row, int dir) {
+         break;
+     }
+     case R_SCALE: {
++#ifdef __ORBIS__
++        int k = cycle(nearest(PS4_SCALES, 5, ds.render_scale > 0 ? ds.render_scale : 1), 5, dir);
++        set_display("render_scale", PS4_SCALE_VALUES[k]);
++        display_set_render_scale(PS4_SCALES[k]);   /* (shown now; the renderer takes it at the next start) */
++        break;
++#endif
+         static const char *const SCALES[] = {"1", "auto", "1.5", "2", "3"};
+         static const float VALUES[] = {1, 0, 1.5f, 2, 3};
+         int n = sizeof SCALES / sizeof *SCALES, i = -1;
+@@ -451,6 +507,18 @@ static void change(const Row *row, int dir) {
+         display_set_render_scale(VALUES[i]);   /* (shown now; the renderer takes it at the next start) */
+         break;
+     }
++    case R_UPSCALER: {
++        int u = ds.upscaler == UPSCALE_FSR ? UPSCALE_BILINEAR : UPSCALE_FSR;
++        display_set_upscaler(u);
++        set_display("upscaler", u == UPSCALE_FSR ? "fsr" : "bilinear");
++        break;
++    }
++    case R_SHARPNESS: {
++        int k = cycle(nearest(SHARPNESS, 4, ds.fsr_sharpness), 4, dir);
++        display_set_fsr_sharpness(SHARPNESS[k]);
++        set_display("fsr_sharpness", SHARPNESS_VALUES[k]);
++        break;
++    }
+ #ifdef _WIN32
+     case R_GPU: {
+         int i = -1;   /* auto, then the cards */
+@@ -574,6 +642,11 @@ static void action(const Row *row) {
+     case R_QUIT:
+         confirm = row->id;
+         break;
++    case R_PROFILE:
++        close_menu();
++        if (!profile_running()) profile_start(10.0);
++        menu_toast("Recording a profile for 10 seconds: keep playing");
++        break;
+     }
+ }
+ 
+@@ -755,6 +828,7 @@ int menu_frame(int *overlay, int f3) {
+     int focused = gfx_window_focused();
+     int toggle = guide && !guide_held && (focused || open_);
+     guide_held = guide;
++    if (InterlockedExchange(&toggle_asked, 0)) toggle = 1;   /* (the PS4's L3+R3) */
+     if (combo && combo_armed && (focused || open_)) {
+         if (!combo_since) combo_since = now;
+         if (now - combo_since >= 1000) { toggle = 1; combo_armed = 0; }
+@@ -881,7 +955,11 @@ void menu_draw(float w, float h) {
+     char status[512];
+     net_status(status, sizeof status);
+     if (strstr(status, "Room:")) snprintf(banner, sizeof banner, "You are in a netplay room: the game keeps running while this menu is open.");
++#ifdef __ORBIS__
++    else if (restart_pending) snprintf(banner, sizeof banner, "The resolution changes when the game starts again: Restart, on the Graphics page.");
++#else
+     else if (restart_pending) snprintf(banner, sizeof banner, "Some changes take effect when the game starts again: Game > Restart the game.");
++#endif
+     char t[160];
+     if (toast_now(t, sizeof t)) ovl_text(px + 300 * s, py + 34 * s, 24 * s, WHITE, t);   /* (a message, in the menu: here) */
+     else if (banner[0]) ovl_text(px + 300 * s, py + 34 * s, 24 * s, strstr(status, "Room:") ? ACCENT : AMBER, banner);
+@@ -930,16 +1008,26 @@ void menu_draw(float w, float h) {
+         wrap(rows[sel[page]].help, (int)((pw - 80 * s) / (13 * s)), wrapped, sizeof wrapped);
+         ovl_text(px + 36 * s, help_y + 4 * s, 26 * s, OVL_RGBA(200, 210, 230, 255), wrapped);
+     }
++#ifdef __ORBIS__   /* (the DualShock 4 by position: Circle is A, Cross B, Square Y) */
++    ovl_text(px + 36 * s, py + ph - 44 * s, 22 * s, DIM,
++             page == P_REMAP ? "Up/Down: choose   Circle: press a new control   Square: default   Cross: back   L3+R3: close"
++                             : "Up/Down: choose   Left/Right: change   Circle: select   L1/R1: page   Cross or L3+R3: close");
++#else
+     ovl_text(px + 36 * s, py + ph - 44 * s, 22 * s, DIM,
+              page == P_REMAP ? "Up/Down: choose   A/Enter: press a new control   Y/Delete: default   B/Backspace: back   Esc: close"
+                              : "Up/Down: choose   Left/Right: change   A/Enter: select   L/R or Tab, 1-4: page   B/Esc: close");
++#endif
+     /* on top: a question, the text being typed, or a control being waited for */
+     if (confirm) {
+         float bw = 820 * s, bh = 200 * s, bx = (w - bw) / 2, by = (h - bh) / 2;
+         modal_box(w, h, bx, by, bw, bh, s);
+         ovl_text(bx + 36 * s, by + 34 * s, 34 * s, WHITE, confirm == R_RESTART ? "Start the game again?" : "Quit the game?");
+         ovl_text(bx + 36 * s, by + 84 * s, 26 * s, GREY, "A match in progress is lost.");
++#ifdef __ORBIS__
++        ovl_text(bx + 36 * s, by + 140 * s, 26 * s, AMBER, "Circle: yes      Cross: no");
++#else
+         ovl_text(bx + 36 * s, by + 140 * s, 26 * s, AMBER, "A / Enter: yes      B / Esc: no");
++#endif
+     } else if (editing) {
+         float bw = 900 * s, bh = 600 * s, bx = (w - bw) / 2, by = (h - bh) / 2, cs = 56 * s;
+         modal_box(w, h, bx, by, bw, bh, s);
+diff --git a/runtime/gpu_menu.h b/runtime/gpu_menu.h
+index b7cf1bf..28480d4 100644
+--- a/runtime/gpu_menu.h
++++ b/runtime/gpu_menu.h
+@@ -13,6 +13,8 @@ enum { MENU_KEY_ESC = 1, MENU_KEY_UP, MENU_KEY_DOWN, MENU_KEY_LEFT, MENU_KEY_RIG
+        MENU_KEY_TAB, MENU_KEY_SHIFT_TAB, MENU_KEY_DELETE };
+ void menu_key(int key);
+ void menu_char(unsigned ch);
++/* Open or close it at the next frame (from any thread: the PS4's pads, L3+R3). */
++void menu_request_toggle(void);
+ 
+ /* The renderer, at each present before the overlay: the pads, the queued keys and what they
+  * change. overlay is the frame-rate overlay's switch (F1). Returns MENU_SHOT when a screenshot
 diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
 index e822de7..e498d1a 100644
 --- a/runtime/hle_pad.c
@@ -245,6 +793,28 @@ index e822de7..e498d1a 100644
  #ifdef _WIN32
      HMODULE m = LoadLibraryA("xinput1_4.dll");
      if (!m) m = LoadLibraryA("xinput9_1_0.dll");
+diff --git a/runtime/hle_settings.c b/runtime/hle_settings.c
+index 4df35f9..6487c68 100644
+--- a/runtime/hle_settings.c
++++ b/runtime/hle_settings.c
+@@ -295,6 +295,17 @@ void settings_restart(void) {
+     CloseHandle(pi.hProcess);
+     ExitProcess(0);
+ }
++#elif defined(__ORBIS__)
++/* The PS4: the system starts the app's eboot again in place of this one (libSceSystemService). */
++int sceSystemServiceLoadExec(const char *path, const char *args[]);
++
++void settings_restart(void) {
++    fprintf(stderr, "[settings] starting the game again\n");
++    fflush(stderr);
++    fflush(stdout);
++    int err = sceSystemServiceLoadExec("/app0/eboot.bin", NULL);
++    fprintf(stderr, "[settings] could not start the game again (%#x): close it and start it from the home screen\n", (unsigned)err);
++}
+ #else
+ void settings_restart(void) {
+     if (online_files)
 diff --git a/runtime/host.c b/runtime/host.c
 index ac98629..2346285 100644
 --- a/runtime/host.c
@@ -2150,10 +2720,10 @@ index 0000000..d7938d9
 +}
 diff --git a/runtime/ps4/pad.c b/runtime/ps4/pad.c
 new file mode 100644
-index 0000000..0af8d3c
+index 0000000..588d762
 --- /dev/null
 +++ b/runtime/ps4/pad.c
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,96 @@
 +/* The PS4's controllers for hle_pad.c: DualShock 4s through libScePad, behind the XInput backend's
 + * two calls (XInputGetState, XInputSetState). Pad i is the i-th signed-in user's (up to 4);
 + * users who sign in later are found when their pad is next asked for (every half second while
@@ -2168,7 +2738,7 @@ index 0000000..0af8d3c
 +
 +#include <windows.h>
 +
-+#include "../debug_profile.h"
++#include "../gpu_menu.h"
 +
 +typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XPad;   /* (hle_pad.c's) */
 +typedef struct { DWORD packet; XPad pad; } XState;
@@ -2236,11 +2806,12 @@ index 0000000..0af8d3c
 +    out->pad.ly = axis(d.leftStick.y, 1);
 +    out->pad.rx = axis(d.rightStick.x, 0);
 +    out->pad.ry = axis(d.rightStick.y, 1);
-+    /* L3+R3 pressed together: a 10 s profile (debug_profile.h; F6 on a PC) */
-+    static int combo_held;
++    /* L3+R3 pressed together: the settings menu, opened or closed (gpu_menu.c; its Graphics page also
++     * saves a 10 s profile, debug_profile.h) - from any of the pads, each with its own press */
++    static int combo_held[PADS];
 +    int combo = (d.buttons & (ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3)) == (ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3);
-+    if (combo && !combo_held) profile_start(10.0);
-+    combo_held = combo;
++    if (combo && !combo_held[i]) menu_request_toggle();
++    combo_held[i] = combo;
 +    return 0;
 +}
 +
