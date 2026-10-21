@@ -238,6 +238,43 @@ index c1507b4..371a2eb 100644
      m_workers.compilePipelineLibrary(library, DxvkPipelinePriority::Normal);
    }
  
+diff --git a/src/dxvk/dxvk_shader_cache.cpp b/src/dxvk/dxvk_shader_cache.cpp
+index 0bec839..b249e7d 100644
+--- a/src/dxvk/dxvk_shader_cache.cpp
++++ b/src/dxvk/dxvk_shader_cache.cpp
+@@ -7,6 +7,11 @@
+ 
+ namespace dxvk {
+ 
++  // The cache's own version: the DXVK whose file format it has (the SSBU port's shader pack on the
++  // console, a gigabyte, was made by v3.1.1-5-gd0e7592), not this build's git version - so that a
++  // change elsewhere in DXVK keeps the cache. Raise it when the cache's format changes.
++  static const char* const ShaderCacheVersion = "v3.1.1-5-gd0e7592";
++
+   DxvkShaderCache::Instance DxvkShaderCache::s_instance;
+ 
+   DxvkShaderCache::DxvkShaderCache()
+@@ -186,7 +191,7 @@ namespace dxvk {
+ 
+     LutHeader header = { };
+     header.magic = { 'D', 'X', 'V', 'K' };
+-    header.versionString = DXVK_VERSION;
++    header.versionString = ShaderCacheVersion;
+ 
+     if (!writeHeader(m_lutFile, header)) {
+       Logger::warn(str::format("Failed to write cache header: ", path + m_filePaths.lutFile));
+@@ -209,9 +214,9 @@ namespace dxvk {
+       return false;
+     }
+ 
+-    if (header.versionString != DXVK_VERSION) {
++    if (header.versionString != ShaderCacheVersion) {
+       Logger::warn(str::format("Cache was created with DXVK version ", header.versionString,
+-        ", but current version is ", DXVK_VERSION, ". Discarding old cache."));
++        ", but current version is ", ShaderCacheVersion, ". Discarding old cache."));
+       return false;
+     }
+ 
 diff --git a/src/util/thread.h b/src/util/thread.h
 index ae6f01d..60fc5b8 100644
 --- a/src/util/thread.h
@@ -255,6 +292,88 @@ index ae6f01d..60fc5b8 100644
        ::sched_param param = {};
        int32_t policy;
        switch (priority) {
+diff --git a/src/util/util_file.cpp b/src/util/util_file.cpp
+index 30bba97..0a957c5 100644
+--- a/src/util/util_file.cpp
++++ b/src/util/util_file.cpp
+@@ -1,4 +1,6 @@
++#include <cstring>
+ #include <fstream>
++#include <vector>
+ 
+ #include "./com/com_include.h"
+ 
+@@ -177,16 +179,45 @@ namespace dxvk::util {
+       if (!status())
+         return false;
+ 
++      // Small reads come from a window of the file kept here: the shader cache reads its look-up
++      // table and each shader's metadata a field at a time, and every seek dropped the stream's
++      // buffer - a system call for every few bytes (the PS4: most of a cached shader's load).
++      if (offset >= m_windowOffset && offset + size <= m_windowOffset + m_window.size()) {
++        std::memcpy(data, m_window.data() + (offset - m_windowOffset), size);
++        return true;
++      }
++
+       if (!m_file.seekg(offset, std::ios_base::beg))
+         return false;
+ 
+-      return bool(m_file.read(reinterpret_cast<char*>(data), size));
++      if (size >= WindowSize)
++        return bool(m_file.read(reinterpret_cast<char*>(data), size));
++
++      m_window.resize(WindowSize);
++      m_file.read(reinterpret_cast<char*>(m_window.data()), WindowSize);
++      size_t got = size_t(m_file.gcount());
++      m_window.resize(got);
++      m_windowOffset = offset;
++
++      if (got < size) {
++        // past the end, as a read of the stream itself would be: failed from now on
++        m_window.clear();
++        return false;
++      }
++
++      if (got < WindowSize)
++        m_file.clear();   // (the end of the file inside the window: not this read's failure)
++
++      std::memcpy(data, m_window.data(), size);
++      return true;
+     }
+ 
+     bool write(size_t offset, size_t size, const void* data) {
+       if (!status())
+         return false;
+ 
++      m_window.clear();
++
+       if (!m_file.seekp(offset, std::ios_base::beg))
+         return false;
+ 
+@@ -197,6 +228,8 @@ namespace dxvk::util {
+       if (!status())
+         return false;
+ 
++      m_window.clear();
++
+       if (!m_file.seekp(0, std::ios_base::end))
+         return false;
+ 
+@@ -231,9 +264,14 @@ namespace dxvk::util {
+ 
+   private:
+ 
++    static constexpr size_t WindowSize = 64u << 10;
++
+     FileFlags     m_flags = { };
+     std::fstream  m_file;
+ 
++    std::vector<uint8_t> m_window;
++    size_t        m_windowOffset = 0u;
++
+   };
+ 
+   using FileImpl = StlFile;
 diff --git a/src/util/util_math.h b/src/util/util_math.h
 index 9276d93..a712940 100644
 --- a/src/util/util_math.h

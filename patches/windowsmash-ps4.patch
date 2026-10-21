@@ -1,5 +1,5 @@
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..c3d9f1b 100644
+index f685d58..51027cd 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -449,6 +449,7 @@ static const char DECODE_HLSL[] =
@@ -18,10 +18,28 @@ index f685d58..c3d9f1b 100644
      start_compilers();
      /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
       * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
-@@ -999,6 +1001,75 @@ static void cache_path(const Shader *s, char *path, size_t n) {
+@@ -999,6 +1001,105 @@ static void cache_path(const Shader *s, char *path, size_t n) {
      shader_cache_file(path, n, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
  }
  
++static u32 pack_count;
++
++/* With a pack (below), what is compiled since goes to a folder of its own beside the folder, "<cache dir>-new": a
++ * look-up in it is quick, and its files are few enough to take to the PC for the next pack - the console's FTP
++ * server gave up listing the 45,000-file folder. */
++static const char *new_dir(void) {
++    static char dir[1100];
++    if (!dir[0]) {
++        snprintf(dir, sizeof dir, "%s-new", cache_dir());
++        CreateDirectoryA(dir, NULL);
++    }
++    return dir;
++}
++
++static void new_path(const Shader *s, char *path, size_t n) {
++    shader_cache_file(path, n, new_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
++}
++
 +/* The disk cache's files in one ("<cache dir>.pak", the SSBU port's scripts/pack-shadercache.py): a header, a table of
 + * the files' names (FNV-1a of each, sorted) with where each one's bytes are, and the bytes. Where a look-up in a
 + * folder of tens of thousands of files is slow - the PS4's: the renderer waited in stat 30% of its time while a match
@@ -29,7 +47,6 @@ index f685d58..c3d9f1b 100644
 + * place. The folder is still asked for what the pack has not (shaders compiled since), and written to. */
 +typedef struct { u64 name, offset; u32 size, pad; } PackEntry;
 +static PackEntry *pack_index;
-+static u32 pack_count;
 +static HANDLE pack_file = INVALID_HANDLE_VALUE;
 +
 +static void pack_open(void) {
@@ -67,6 +84,19 @@ index f685d58..c3d9f1b 100644
 +    return lo < pack_count && pack_index[lo].name == name ? &pack_index[lo] : NULL;
 +}
 +
++/* Whether a shader's DXBC was kept: in the pack (path: its name in the folder), else in the new folder (path: that
++ * file), else in the folder. */
++static int cache_find(const Shader *s, char *path, size_t n) {
++    cache_path(s, path, n);
++    if (pack_find(path)) return 1;
++    if (pack_count) {
++        char beside[1200];
++        new_path(s, beside, sizeof beside);
++        if (GetFileAttributesA(beside) != INVALID_FILE_ATTRIBUTES) { snprintf(path, n, "%s", beside); return 1; }
++    }
++    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++}
++
 +/* A cache file's bytes (to free), from the pack or else the folder; NULL if neither has them. */
 +static void *cache_read(const char *path, long *size) {
 +    const PackEntry *e = pack_find(path);
@@ -94,7 +124,7 @@ index f685d58..c3d9f1b 100644
  /* A file the ahead-of-time compiler wrote (dated 2001), now used by the game: dated now, so the
   * next start's prewarm makes it. */
  static void cache_touch(const char *path) {
-@@ -1023,14 +1094,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
+@@ -1023,14 +1124,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
   * device, which compiles right here (its object is not needed: the rendering device finds the
   * GPU code in the driver's cache - measured 3.5 ms of its time a shader instead of 190 ms),
   * then the object the draws use */
@@ -118,7 +148,7 @@ index f685d58..c3d9f1b 100644
      return ok;
  }
  
-@@ -1107,16 +1187,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+@@ -1107,16 +1217,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
          char path[1200];
          cache_path(s, path, sizeof path);
          me->step = STEP_CACHE;
@@ -139,9 +169,13 @@ index f685d58..c3d9f1b 100644
      }
      AcquireSRWLockExclusive(&prewarm_lock);
      if (go && p->state == PW_LOADING) {
-@@ -1137,23 +1211,22 @@ static LONG make_ready(struct Compiler *me, Shader *s) {
+@@ -1135,26 +1239,32 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+ /* (on a compiler thread) the shader's GPU code: 1 ready, 2 failed */
+ static LONG make_ready(struct Compiler *me, Shader *s) {
      char path[1200];
-     cache_path(s, path, sizeof path);
+-    cache_path(s, path, sizeof path);
++    int kept = s->cached && cache_find(s, path, sizeof path);
++    if (!kept) cache_path(s, path, sizeof path);
      me->step = STEP_CACHE;
 -    FILE *f = s->cached ? fopen(path, "rb") : NULL;
 -    if (f) {   /* compiled in an earlier run */
@@ -154,7 +188,7 @@ index f685d58..c3d9f1b 100644
 -        free(code);
 -        if (ok) { cache_touch(path); return 1; }
 +    long n = 0;
-+    void *cached = s->cached ? cache_read(path, &n) : NULL;
++    void *cached = kept ? cache_read(path, &n) : NULL;
 +    if (cached) {   /* compiled in an earlier run */
 +        int ok = create_noted(me, s, cached, n);
 +        free(cached);
@@ -165,20 +199,28 @@ index f685d58..c3d9f1b 100644
      }
      me->step = STEP_FXC;
      ID3DBlob *code = NULL, *errors = NULL;
++    u64 t0 = rt_clock_ns();
      HRESULT hr = shader_cache_compile(s->hlsl, s->name, s->stage, &code, &errors);
++    u64 compile_ns = rt_clock_ns() - t0;
      LONG state = 2;
      if (SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code))) {
 -        f = fopen(path, "wb");
++        if (pack_count) new_path(s, path, sizeof path);   /* (beside the pack's folder: new_dir) */
 +        FILE *f = fopen(path, "wb");
          if (f) { fwrite(ID3D10Blob_GetBufferPointer(code), 1, ID3D10Blob_GetBufferSize(code), f); fclose(f); }
++        /* by name: what the next shader pack is to have (a draw with it was skipped meanwhile) */
++        const char *base = strrchr(path, '/');
++        fprintf(stderr, "[gfx] %s: not in the shader cache, compiled from HLSL in %.1f s\n", base ? base + 1 : path, compile_ns / 1e9);
          state = 1;
      } else {
-@@ -1475,7 +1548,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+         fprintf(stderr, "[gfx] shader %s failed to compile:\n%.2000s\n", s->name,
+@@ -1474,8 +1584,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+         return s;
      }
      char path[1200];
-     cache_path(s, path, sizeof path);
+-    cache_path(s, path, sizeof path);
 -    s->cached = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
-+    s->cached = pack_find(path) || GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++    s->cached = cache_find(s, path, sizeof path);
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
       * leaves its outputs (skinned vertices) unwritten for a frame */
@@ -2508,6 +2550,76 @@ index 0000000..b241467
 +        if (every > 0 && status) status();
 +    }
 +}
+diff --git a/runtime/recomp.h b/runtime/recomp.h
+index a5909c2..cd8cb5a 100644
+--- a/runtime/recomp.h
++++ b/runtime/recomp.h
+@@ -181,6 +181,20 @@ static inline f32 fminnmS(f32 a, f32 b) { return a != a ? b : b != b ? a : fminS
+ static inline f64 fmaxnmD(f64 a, f64 b) { return a != a ? b : b != b ? a : fmaxD(a, b); }
+ static inline f64 fminnmD(f64 a, f64 b) { return a != a ? b : b != b ? a : fminD(a, b); }
+ 
++#ifndef __FMA__
++/* A processor without fused multiply-add (the PS4's Jaguar): libm's fmaf is a call for each one -
++ * four for a vector's - with the registers spilled around it. Its common case inline: the product
++ * is exact in double, and the sum rounded to double and then to float is fmaf's result, unless that
++ * sum lies halfway between two floats (or is not finite): those go to libm's, as before. */
++static inline f32 rt_fmaf(f32 a, f32 b, f32 c) {
++    f64 r = (f64)a * b + c;
++    u64 u; memcpy(&u, &r, 8);
++    if (__builtin_expect((u & 0x1FFFFFFFull) != 0x10000000ull, 1) && (u >> 52 & 0x7FF) != 0x7FF) return (f32)r;
++    return (fmaf)(a, b, c);
++}
++#define fmaf(a, b, c) rt_fmaf(a, b, c)
++#endif
++
+ /* fmulx / Newton-Raphson step helpers: fused, and inf * 0 has a defined result. */
+ #define RT_INF_ZERO(a, b) ((isinf(a) && (b) == 0) || ((a) == 0 && isinf(b)))
+ static inline f32 rt_fmulx32(f32 a, f32 b) { return RT_INF_ZERO(a, b) ? (signbit(a) != signbit(b) ? -2.0f : 2.0f) : a * b; }
+@@ -200,12 +214,38 @@ static inline f64 rt_frsqrts64(f64 a, f64 b) {
+ /* Reciprocal and reciprocal-square-root estimates: the architecture's table algorithm,
+  * which x86's rcpps / rsqrtps do not reproduce. */
+ static inline u32 rt_recip_est(u32 a) { a = a * 2 + 1; return ((1u << 19) / a + 1) / 2; }
+-static inline u32 rt_rsqrt_est(u32 a) {
+-    a = a < 256 ? a * 2 + 1 : ((a & ~1u) + 1) * 2;
+-    u32 b = 512;
+-    while ((u64)a * (b + 1) * (b + 1) < (1ull << 28)) b++;
+-    return (b + 1) / 2;
+-}
++/* The reciprocal square root's, for a in [128, 512): the architecture's loop
++ *     a = a < 256 ? a * 2 + 1 : ((a & ~1) + 1) * 2;  b = 512;
++ *     while (a * (b + 1) * (b + 1) < 2^28) b++;      return (b + 1) / 2;
++ * takes up to ~500 steps an estimate - a vector's four of them - and the game normalises its
++ * vectors with it: half of a match's main thread on the PS4 (v00.17). Its results, worked out once. */
++static const u16 rt_rsqrt_table[384] = {
++    511, 509, 507, 505, 503, 501, 499, 498, 496, 494, 492, 490, 489, 487, 485, 484,
++    482, 480, 479, 477, 475, 474, 472, 471, 469, 468, 466, 465, 463, 462, 460, 459,
++    457, 456, 454, 453, 452, 450, 449, 448, 446, 445, 444, 442, 441, 440, 439, 437,
++    436, 435, 434, 432, 431, 430, 429, 428, 426, 425, 424, 423, 422, 421, 420, 419,
++    418, 416, 415, 414, 413, 412, 411, 410, 409, 408, 407, 406, 405, 404, 403, 402,
++    401, 400, 399, 398, 397, 396, 396, 395, 394, 393, 392, 391, 390, 389, 388, 387,
++    387, 386, 385, 384, 383, 382, 382, 381, 380, 379, 378, 377, 377, 376, 375, 374,
++    374, 373, 372, 371, 370, 370, 369, 368, 367, 367, 366, 365, 365, 364, 363, 362,
++    361, 361, 360, 360, 359, 359, 357, 357, 356, 356, 355, 355, 353, 353, 352, 352,
++    351, 351, 349, 349, 348, 348, 347, 347, 346, 346, 344, 344, 343, 343, 342, 342,
++    341, 341, 340, 340, 338, 338, 337, 337, 336, 336, 335, 335, 334, 334, 333, 333,
++    332, 332, 331, 331, 330, 330, 328, 328, 327, 327, 326, 326, 325, 325, 324, 324,
++    323, 323, 322, 322, 321, 321, 320, 320, 319, 319, 318, 318, 317, 317, 316, 316,
++    316, 316, 315, 315, 314, 314, 313, 313, 312, 312, 311, 311, 310, 310, 309, 309,
++    308, 308, 307, 307, 307, 307, 306, 306, 305, 305, 304, 304, 303, 303, 302, 302,
++    302, 302, 301, 301, 300, 300, 299, 299, 298, 298, 298, 298, 297, 297, 296, 296,
++    295, 295, 294, 294, 294, 294, 293, 293, 292, 292, 291, 291, 291, 291, 290, 290,
++    289, 289, 289, 289, 288, 288, 287, 287, 286, 286, 286, 286, 285, 285, 284, 284,
++    284, 284, 283, 283, 282, 282, 282, 282, 281, 281, 280, 280, 280, 280, 279, 279,
++    278, 278, 278, 278, 277, 277, 276, 276, 276, 276, 275, 275, 275, 275, 274, 274,
++    273, 273, 273, 273, 272, 272, 272, 272, 271, 271, 270, 270, 270, 270, 269, 269,
++    269, 269, 268, 268, 267, 267, 267, 267, 266, 266, 266, 266, 265, 265, 265, 265,
++    264, 264, 264, 264, 263, 263, 262, 262, 262, 262, 261, 261, 261, 261, 260, 260,
++    260, 260, 259, 259, 259, 259, 258, 258, 258, 258, 257, 257, 257, 257, 256, 256,
++};
++static inline u32 rt_rsqrt_est(u32 a) { return rt_rsqrt_table[a - 128]; }
+ #define RT_FRAC52 0xFFFFFFFFFFFFFull
+ static inline u64 rt_frecpe_frac(u64 frac, int *exp, int top) {
+     if (!*exp) {
 diff --git a/tools/ps4/build_codecs_ps4.py b/tools/ps4/build_codecs_ps4.py
 new file mode 100644
 index 0000000..45e2fa5
