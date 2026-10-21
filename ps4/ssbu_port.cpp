@@ -1,6 +1,7 @@
 // The SSBU port's hooks into WindowSmash's PS4 runtime (runtime/ps4 in patches/windowsmash-ps4.patch) and into the
 // PS4 layer (port/): its start (the screen opened before any graphics, as SMW's boot screen does; DXVK's settings),
 // where the Vulkan WSI's lines go, and the crash log's guest part.
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,10 @@
 
 extern "C" void ps4_boot_trace(const char* stage);  // port/ps4_crashlog.cpp
 extern "C" void ps4_profile_thread_begin();         // port/ps4_profile.cpp
+extern "C" uint64_t ps4_new_thread_cores;            // port/ps4_runtime.cpp: the cores new threads start on
+extern "C" void* scePthreadSelf();
+extern "C" int scePthreadSetaffinity(void* thread, uint64_t mask);
+extern "C" int scePthreadGetaffinity(void* thread, uint64_t* mask);
 
 void ssbu::ps4::wsi_log(const char* line) {
     std::fprintf(stderr, "%s\n", line);
@@ -65,6 +70,24 @@ extern "C" void ps4_port_start() {
     // the game itself keeps one core busy and a little of two more, and a match's first draws wait
     // on hundreds of shaders
     setenv("SSBU_COMPILE_THREADS", "3", 0);
+    // RADV's shader cache (scripts/build-mesa.sh): the GPU code of every shader, kept between runs - on
+    // this CPU the driver takes about a second a shader, and a match's draws are skipped until theirs
+    // are made. Mesa's single-file kind (one file and its index, appended to).
+    mkdir("/data/SSBU/mesa", 0777);
+    setenv("MESA_SHADER_CACHE_DIR", "/data/SSBU/mesa", 0);
+    setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0);
+    // The 7th core, when the system grants it (it shares it): new threads may run on it too.
+    {
+        void* self = scePthreadSelf();
+        uint64_t had = 0, got = 0;
+        scePthreadGetaffinity(self, &had);
+        const bool seventh = scePthreadSetaffinity(self, 0x40) == 0 && scePthreadGetaffinity(self, &got) == 0 && got == 0x40;
+        scePthreadSetaffinity(self, had);
+        if (seventh)
+            ps4_new_thread_cores = 0x7F;
+        std::fprintf(stderr, "[boot] cores: %s; new threads on %#llx\n", seventh ? "7, the 7th granted" : "6",
+                     static_cast<unsigned long long>(ps4_new_thread_cores));
+    }
     ps4_profile_thread_begin();   // (the main thread: the others from their start)
     if (std::FILE* conf = std::fopen("/data/SSBU/dxvk.conf", "r")) {
         std::fclose(conf);

@@ -42,7 +42,7 @@ constexpr int kSaOnstack = 0x0001, kSaRestart = 0x0002, kSaSiginfo = 0x0040;
 constexpr int kMcontextOffset = 0x40, kRipIndex = 20, kRspIndex = 23;   // measured on hardware (ps4_crashlog.cpp)
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kSystemEnd = 0x1000000000ULL;
 constexpr uint64_t kWaitingTag = 1ULL << 63;
-constexpr int kSlots = 128, kRing = 2048, kCallers = 3;   // threads alive at once; samples a thread per profile
+constexpr int kSlots = 128, kRing = 2048, kCallers = 4;   // threads alive at once; samples a thread per profile
 constexpr long kPeriodNs = 4000000;         // a round every 4 ms
 
 enum : uint32_t { kFree, kAlive, kEnded };   // kEnded: the thread is gone, its samples not yet written
@@ -61,7 +61,7 @@ struct Slot {
     uintptr_t stack_top = 0;   // (its stack, as far as a scan may read: its start's frame)
     std::atomic<uint32_t> count{0};
     uint64_t samples[kRing];
-    uint64_t callers[kRing][kCallers];   // in a system module: the eboot code that called into it, innermost first
+    uint64_t callers[kRing][kCallers];   // the eboot code that called the sampled function, innermost first
 };
 Slot g_slots[kSlots];
 std::atomic<bool> g_running{false}, g_busy{false};   // busy: from the start until it is written
@@ -77,18 +77,23 @@ void onProf(int, siginfo_t*, void* context) {
     const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
     uint64_t rip = regs[kRipIndex], callers[kCallers] = {};
     int ncallers = 0;
-    // in a system module, right after a `syscall` (0f 05): waiting in the kernel. And the eboot code
-    // that called in: the first return address into the eboot's code on the stack (one after a call
-    // instruction), within its stack (a fiber's: the next 4 KiB; 16 KiB at most)
+    // in a system module, right after a `syscall` (0f 05): waiting in the kernel
     if (rip >= kSystemLibs && rip < kSystemEnd) {
         // (or on it: a blocking call the signal interrupted is restarted, the thread put back on its
         // `syscall` - libkernel's _umtx_op stub, its mutex and condition variable waits, at +0x371a)
         const auto* code = reinterpret_cast<const uint8_t*>(rip);
         if (((rip & 0xFFF) >= 2 && code[-2] == 0x0F && code[-1] == 0x05) || (code[0] == 0x0F && code[1] == 0x05))
             rip |= kWaitingTag;
+    }
+    // The eboot code that called in: return addresses into the eboot's code on the stack (one after a
+    // call instruction), within its stack (16 KiB at most; on a fiber's, whose top is not known, to the
+    // end of the 16 KiB page rsp is in: a fiber that has just started is near its stack's top, and what
+    // lies past it may not be mapped). For every sample: a busy eboot function's own callers too
+    // (v00.13: who reads the clock so often). Found by scanning, so now and then a stale one.
+    {
         const uintptr_t rsp = regs[kRspIndex], text = reinterpret_cast<uintptr_t>(__text_start),
                         text_end = reinterpret_cast<uintptr_t>(__eh_frame_start);
-        const uintptr_t limit = std::min<uintptr_t>(rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : rsp + 4096,
+        const uintptr_t limit = std::min<uintptr_t>(rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : (rsp | 0x3FFF) + 1,
                                                     rsp + 16384);
         for (uintptr_t at = rsp & ~7ull; at + 8 <= limit && ncallers < kCallers; at += 8) {
             const uint64_t v = *reinterpret_cast<const uint64_t*>(at);

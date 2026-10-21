@@ -30,7 +30,7 @@ ps4_cmake -S "$HERE/../ps4" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$HERE/../toolchain/ps4-ssbu.cmake" \
     "-DCMAKE_PROJECT_ssbu_INCLUDE=$HERE/../toolchain/ps4-love-style.cmake" \
     -DPS4_PAID="${PS4_PAID:-0x3800000000000035}" \
-    -DPS4_MESA_BUILD="$PS4_BUILD_ROOT/build/mesa" -DSSBU_OBJECTS="$OBJ" >/dev/null
+    -DPS4_MESA_BUILD="$PS4_BUILD_ROOT/build/mesa-cache" -DSSBU_OBJECTS="$OBJ" >/dev/null
 rm -f "$BUILD/eboot_eboot/eboot.bin" "$BUILD/eboot"   # (a failed link must not be packaged)
 touch "$OBJ/objects.rsp"   # (relink: the objects may have changed under the same list)
 ninja -C "$BUILD"

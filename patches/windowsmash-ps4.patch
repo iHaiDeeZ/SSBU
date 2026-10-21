@@ -1,3 +1,31 @@
+diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
+index f685d58..ab26782 100644
+--- a/runtime/gpu_d3d11.c
++++ b/runtime/gpu_d3d11.c
+@@ -1023,14 +1023,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
+  * device, which compiles right here (its object is not needed: the rendering device finds the
+  * GPU code in the driver's cache - measured 3.5 ms of its time a shader instead of 190 ms),
+  * then the object the draws use */
++static volatile LONG64 driver_made, driver_ns;   /* (shaders the driver made, and its time for them) */
+ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t size) {
+     me->dxbc = code;
+     me->dxbc_size = size;
+     me->step = STEP_DRIVER;
++    u64 t0 = rt_clock_ns();
+     void *warm = NULL;
+     if (compile_dev && SUCCEEDED(create_on(compile_dev, s->stage, code, size, &warm))) IUnknown_Release((IUnknown *)warm);
+     int ok = SUCCEEDED(create_on(dev, s->stage, code, size, &s->obj));
+     me->dxbc = NULL;
++    /* the driver's time in the log: a slow one by name, and every 100 the average (DXVK on a
++     * slow CPU: a draw is skipped until its shaders are made) */
++    u64 ns = rt_clock_ns() - t0;
++    LONG64 made = InterlockedIncrement64(&driver_made), total = InterlockedAdd64(&driver_ns, (LONG64)ns);
++    if (ns >= 500000000ull) fprintf(stderr, "[gfx] %s: the driver took %.2f s (%zu bytes of DXBC)\n", s->name, ns / 1e9, size);
++    if (made % 100 == 0)
++        fprintf(stderr, "[gfx] %lld shaders made by the driver, %.0f ms each on average\n", (long long)made, total / 1e6 / made);
+     return ok;
+ }
+ 
 diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
 index e822de7..e498d1a 100644
 --- a/runtime/hle_pad.c

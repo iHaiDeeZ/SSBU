@@ -1,0 +1,140 @@
+From 713601e6e34378c5a27e6bcd0ab3164ee4583cd8 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:02:12 +0300
+Subject: [PATCH 1/3] SSBU: address32_hi and the vertex fetch rule in the
+ shader cache's identity
+
+---
+ src/amd/vulkan/radv_physical_device.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 411bd7f..852e25d 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -334,6 +334,18 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+       return -1;
+ #endif
+ 
++#if defined(__PS4__) || defined(AC_PS4_ALIGNED_VERTEX_FETCH)
++   /* PS4 (SSBU port): shader binaries embed the upper half of the 32-bit GPU address window
++    * (descriptor and vertex buffer pointers), which the PS4 layer reserves at start (so far always
++    * 0x44), and the vertex fetch rule is a run-time switch: both in the cache's identity, so a
++    * cache made under other values (or on the PC, for the PS4) is never used for the wrong ones. */
++   {
++      extern int ac_ps4_unaligned_vertex_fetch;
++      const uint32_t ps4_key[2] = {pdev->info.address32_hi, (uint32_t)ac_ps4_unaligned_vertex_fetch};
++      _mesa_sha1_update(&ctx, ps4_key, sizeof(ps4_key));
++   }
++#endif
++
+    _mesa_sha1_final(&ctx, sha1);
+ 
+    memcpy(uuid, sha1, VK_UUID_SIZE);
+-- 
+2.53.0
+
+
+From 2bfa409ad17d04d2cf6ec782c6f426b24e15df7b Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:05:45 +0300
+Subject: [PATCH 2/3] SSBU: the shader cache's hits and misses in the log;
+ Mesa's own-user check off on the PS4
+
+---
+ src/util/disk_cache.c | 12 ++++++++++++
+ src/util/u_debug.h    |  2 +-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index d86153a..b58427c 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -630,6 +630,18 @@ disk_cache_get(struct disk_cache *cache, const cache_key key, size_t *size)
+          p_atomic_inc(&cache->stats.misses);
+    }
+ 
++#ifdef __PS4__
++   /* PS4 (SSBU port): how the cache does, in the log (the process is never ended normally, so
++    * MESA_SHADER_CACHE_SHOW_STATS's line at exit never comes): the first lookups, then every 500 */
++   {
++      static uint32_t ps4_hits, ps4_misses;
++      const uint32_t h = buf ? p_atomic_inc_return(&ps4_hits) : p_atomic_read(&ps4_hits);
++      const uint32_t m = buf ? p_atomic_read(&ps4_misses) : p_atomic_inc_return(&ps4_misses);
++      if (h + m <= 8 || (h + m) % 500 == 0)
++         fprintf(stderr, "mesa: shader cache: %u found, %u not (%s)\n", h, m, cache->path ? cache->path : "?");
++   }
++#endif
++
+    return buf;
+ }
+ 
+diff --git a/src/util/u_debug.h b/src/util/u_debug.h
+index 9608e97..2cf6459 100644
+--- a/src/util/u_debug.h
++++ b/src/util/u_debug.h
+@@ -402,7 +402,7 @@ debug_get_option_ ## suffix (void) \
+ static inline bool
+ __normal_user(void)
+ {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__PS4__) /* (PS4: one user; its ids say nothing about setuid) */
+    return true;
+ #else
+    return geteuid() == getuid() && getegid() == getgid();
+-- 
+2.53.0
+
+
+From d2abe4fce779270dfdb3ee7c9d4ffa33a92d8eb4 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:08:32 +0300
+Subject: [PATCH 3/3] SSBU: the disk cache's index in memory on the PS4 (no
+ shared file mapping)
+
+---
+ src/util/disk_cache_os.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index f31c8dc..6ea537a 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -1107,6 +1107,22 @@ disk_cache_mmap_cache_index(void *mem_ctx, struct disk_cache *cache)
+    int fd = -1;
+    bool mapped = false;
+ 
++#ifdef __PS4__
++   /* PS4 (SSBU port): the index (the cache's size and keys, for the multi-file cache's eviction and
++    * disk_cache_put_key) in memory of its own: a shared mapping of a file is not to be relied on
++    * here, and the single-file cache, RADV's, never reads it. */
++   {
++      const size_t size = sizeof(*cache->size) + CACHE_INDEX_MAX_KEYS * CACHE_KEY_SIZE;
++      cache->index_mmap = calloc(1, size);
++      if (!cache->index_mmap)
++         return false;
++      cache->index_mmap_size = size;
++      cache->size = (p_atomic_uint64_t *) cache->index_mmap;
++      cache->stored_keys = cache->index_mmap + sizeof(uint64_t);
++      return true;
++   }
++#endif
++
+    char *path = ralloc_asprintf(mem_ctx, "%s/index", cache->path);
+    if (path == NULL)
+       goto path_fail;
+@@ -1180,7 +1196,11 @@ path_fail:
+ void
+ disk_cache_destroy_mmap(struct disk_cache *cache)
+ {
++#ifdef __PS4__
++   free(cache->index_mmap);
++#else
+    munmap(cache->index_mmap, cache->index_mmap_size);
++#endif
+ }
+ 
+ void *
+-- 
+2.53.0
+

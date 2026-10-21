@@ -122,7 +122,7 @@ set(PS4_AUTH_INFO "000000000000000000000000001C004000FF0000000000800000000000000
 # as Mesa's own shared-library link does: the dispatch tables refer to entry points through weak
 # symbols, which don't pull archive members (they'd silently be NULL). libvulkan_radeon.a
 # already contains the Vulkan runtime and WSI objects.
-set(PS4_MESA_BUILD "$ENV{HOME}/ssbu-build/build/mesa" CACHE PATH "Mesa PS4 build directory")
+set(PS4_MESA_BUILD "$ENV{HOME}/ssbu-build/build/mesa-cache" CACHE PATH "Mesa PS4 build directory")
 function(ps4_link_mesa target)
     set(libs
         src/amd/vulkan/libvulkan_radeon.a src/amd/common/libamd_common.a
