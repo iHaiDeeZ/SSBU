@@ -1,12 +1,15 @@
 diff --git a/runtime/debug_watchdog.c b/runtime/debug_watchdog.c
-index 2fc9e3f..fbd967f 100644
+index 2fc9e3f..1864ae4 100644
 --- a/runtime/debug_watchdog.c
 +++ b/runtime/debug_watchdog.c
-@@ -26,6 +26,11 @@ void kernel_thread_states(void (*line)(const char *text));
+@@ -26,6 +26,14 @@ void kernel_thread_states(void (*line)(const char *text));
  void rt_report_path(char *path, size_t n, const char *kind, const char *ext);
  int rt_write_dump(const char *path, DWORD tid, EXCEPTION_POINTERS *e, DWORD wait_ms);
  
 +#ifdef __ORBIS__
++extern HANDLE gpu_thread_handle;   /* (gpu_queue.c) */
++extern int rt_bt_host_lines;       /* (host.c) */
++void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text));
 +int ps4_watchdog_setprio(void *thread, int prio) __asm__("scePthreadSetprio");
 +void *ps4_watchdog_self(void) __asm__("scePthreadSelf");
 +#endif
@@ -14,7 +17,22 @@ index 2fc9e3f..fbd967f 100644
  static volatile U64 last_present;
  static volatile U64 presented;
  static volatile LONG paused, started = -1;
-@@ -65,6 +70,12 @@ static void write_report(U64 since, int first) {
+@@ -48,6 +56,14 @@ static void write_report(U64 since, int first) {
+     fprintf(report, "  kernel: %s%lu\n  GPU channel: %s%lu\n\n", kernel_lock_owner() ? "held by thread " : "free ", (unsigned long)kernel_lock_owner(),
+             nv_lock_owner() ? "held by thread " : "free ", (unsigned long)nv_lock_owner());
+     gfx_report_compiles(to_report);
++#ifdef __ORBIS__   /* (the renderer's own thread: what it is doing while no frame comes, host frames as ELF addresses) */
++    if (gpu_thread_handle) {
++        fprintf(report, "\nThe GPU thread (renderer), innermost first:\n");
++        rt_bt_host_lines = 1;
++        rt_backtrace_thread_lines(gpu_thread_handle, 40, to_report);
++        rt_bt_host_lines = 0;
++    }
++#endif
+     fprintf(report, "\nGuest threads:\n");
+     kernel_thread_states(to_report);
+     fprintf(report, "\nEvery thread's stack (innermost first):\n");
+@@ -65,6 +81,12 @@ static void write_report(U64 since, int first) {
  static DWORD WINAPI watchdog(void *unused) {
      (void)unused;
      SetThreadDescription(GetCurrentThread(), L"freeze watchdog");
@@ -60,7 +78,7 @@ index 4a4d0e2..72f666e 100644
 +void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
 +void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..06bc863 100644
+index f685d58..6b24876 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -48,6 +48,14 @@ static u32 final_w, final_h;
@@ -554,7 +572,7 @@ index f685d58..06bc863 100644
  }
  
  /* For a crash or freeze report: what each compiler thread is doing (to line, a line at a time),
-@@ -1474,8 +1790,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+@@ -1474,13 +1790,25 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
          return s;
      }
      char path[1200];
@@ -563,8 +581,29 @@ index f685d58..06bc863 100644
 +    s->cached = cache_find(s, path, sizeof path);
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
-      * leaves its outputs (skinned vertices) unwritten for a frame */
-@@ -1731,6 +2046,99 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
+-     * leaves its outputs (skinned vertices) unwritten for a frame */
+-    if (stage == SHADER_COMPUTE && s->cached)
+-        for (u64 until = GetTickCount64() + 250; s->state == 0 && GetTickCount64() < until;) SwitchToThread();
++     * leaves its outputs (skinned vertices) unwritten for a frame. 60 ms at most on the PS4, where
++     * one takes ~150 ms from the disk cache: a new fighter's dozen-odd at 250 ms each made seconds
++     * of 6 fps at a match's start (v00.22); SSBU_COMPUTE_WAIT_MS sets it. */
++    static int wait_ms = -1;
++    if (wait_ms < 0) {
++#ifdef __ORBIS__
++        wait_ms = getenv("SSBU_COMPUTE_WAIT_MS") ? atoi(getenv("SSBU_COMPUTE_WAIT_MS")) : 60;
++#else
++        wait_ms = getenv("SSBU_COMPUTE_WAIT_MS") ? atoi(getenv("SSBU_COMPUTE_WAIT_MS")) : 250;
++#endif
++    }
++    if (stage == SHADER_COMPUTE && s->cached) {
++        for (u64 until = GetTickCount64() + (u64)wait_ms; s->state == 0 && GetTickCount64() < until;) SwitchToThread();
++        static int told;
++        if (s->state == 0 && told++ < 40) fprintf(stderr, "[gfx] %s: not ready after %d ms, launched once it is\n", s->name, wait_ms);
++    }
+     return s;
+ }
+ 
+@@ -1731,6 +2059,99 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
      return u->srv;
  }
  
@@ -664,7 +703,7 @@ index f685d58..06bc863 100644
  static ID3D11Buffer *params_buffer, *index_buffer;
  static u32 index_cap, index_pos, index_first;   /* the index ring: its size, where the next indices go, where this draw's start (in indices) */
  static DrawParams params_written;   /* what params_buffer holds (a draw with the same parameters writes nothing) */
-@@ -3457,7 +3865,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
+@@ -3457,7 +3878,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
          }
          stream_skip[j] = 0;
          Resident *part = resident_overlapping_gpu(start, (u32)size);
@@ -684,7 +723,7 @@ index f685d58..06bc863 100644
          if (size > stream_cap) { stream_data = realloc(stream_data, size + 16); stream_cap = (u32)size; }
          read_gpu(start, (u32)size, stream_data);
          vsrv[n] = stream_srv[j] = part ? upload_composed(SHADER_VERTEX, 18 + n, start, stream_data, (u32)size) : NULL;
-@@ -4346,6 +4765,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4346,6 +4778,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
          ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
          ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -715,7 +754,7 @@ index f685d58..06bc863 100644
      } else {   /* as big as its place or smaller: drawn bilinear */
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
          ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-@@ -4453,12 +4896,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4453,12 +4909,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                   profile_running() ? "  (profiling...)" : "");
          char net[512];
          net_status(net, sizeof net);
@@ -1049,6 +1088,28 @@ index b7cf1bf..28480d4 100644
  
  /* The renderer, at each present before the overlay: the pads, the queued keys and what they
   * change. overlay is the frame-rate overlay's switch (F1). Returns MENU_SHOT when a screenshot
+diff --git a/runtime/gpu_queue.c b/runtime/gpu_queue.c
+index dd10ed6..4d45f33 100644
+--- a/runtime/gpu_queue.c
++++ b/runtime/gpu_queue.c
+@@ -32,6 +32,8 @@ static CONDITION_VARIABLE work = CONDITION_VARIABLE_INIT, progress = CONDITION_V
+ static int enabled = -1;   /* -1 not decided yet */
+ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+ 
++HANDLE gpu_thread_handle;   /* (freeze reports: its stack) */
++
+ static DWORD WINAPI gpu_thread(LPVOID unused) {
+     (void)unused;
+     SetThreadDescription(GetCurrentThread(), L"gpu");
+@@ -58,7 +60,7 @@ static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *ctx) {
+     enabled = !(env && *env == '0');
+     if (enabled) {
+         HANDLE t = CreateThread(NULL, 0, gpu_thread, NULL, 0, NULL);
+-        if (t) CloseHandle(t);
++        if (t) gpu_thread_handle = t;   /* (kept open) */
+         else enabled = 0;
+     }
+     fprintf(stderr, "[gpu] %s\n", enabled ? "submissions run on the GPU thread" : "submissions run in the submitting thread (SSBU_GPU_THREAD=0)");
 diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
 index e822de7..e498d1a 100644
 --- a/runtime/hle_pad.c
@@ -1093,7 +1154,7 @@ index 4df35f9..6487c68 100644
  void settings_restart(void) {
      if (online_files)
 diff --git a/runtime/host.c b/runtime/host.c
-index ac98629..2346285 100644
+index ac98629..67b7084 100644
 --- a/runtime/host.c
 +++ b/runtime/host.c
 @@ -411,8 +411,18 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
@@ -1115,7 +1176,7 @@ index ac98629..2346285 100644
      Dl_info di;
      if (dladdr(pc, &di) && di.dli_fname) {
          const char *base = strrchr(di.dli_fname, '/');
-@@ -459,45 +469,195 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+@@ -459,45 +469,209 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
  }
  #else
  /* Another thread's frames: it is interrupted and records its own stack. */
@@ -1169,7 +1230,9 @@ index ac98629..2346285 100644
 +
 +void rt_backtrace_thread(HANDLE thread, int max_frames) { rt_backtrace_thread_lines(thread, max_frames, line_to_stderr); }
 +
-+/* (a line at a time: the PS4's freeze reports, kernel.c's kernel_thread_stacks) */
++/* (a line at a time: the PS4's freeze reports, kernel.c's kernel_thread_stacks; with
++ * rt_bt_host_lines also the host's frames, as eboot ELF addresses) */
++int rt_bt_host_lines;
 +void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text)) {
      static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
      pid_t tid = rt_thread_tid(thread);
@@ -1201,8 +1264,21 @@ index ac98629..2346285 100644
 +#endif
 +        for (int i = first, shown = 0; i < bt_count && shown < max_frames; i++) {
              u64 guest = guest_of((u64)bt_frames[i]);
-             if (!guest) { if (host_frames) host_frame("      ", bt_frames[i]); continue; }
+-            if (!guest) { if (host_frames) host_frame("      ", bt_frames[i]); continue; }
 -            fprintf(stderr, "      %s\n", rt_describe(guest, name, sizeof name));
++            if (!guest) {
++                if (host_frames) host_frame("      ", bt_frames[i]);
++#ifdef __ORBIS__
++                else if (rt_bt_host_lines && shown < max_frames) {
++                    u64 pc = (u64)bt_frames[i];
++                    if (pc - (u64)__text_start < (u64)(__eh_frame_start - __text_start)) snprintf(text, sizeof text, "      [eboot elf %#llx]\n", pc - (u64)__text_start);
++                    else snprintf(text, sizeof text, "      [%#llx]\n", pc);
++                    line(text);
++                    shown++;
++                }
++#endif
++                continue;
++            }
 +            snprintf(text, sizeof text, "      %s\n", rt_describe(guest, name, sizeof name));
 +            line(text);
              shown++;
@@ -1315,7 +1391,7 @@ index ac98629..2346285 100644
  /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
   * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
   * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
-@@ -513,6 +673,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -513,6 +687,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      static volatile RtTid reporter;
      RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
      (void)si;
@@ -1330,7 +1406,7 @@ index ac98629..2346285 100644
  #else
      int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
      if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
-@@ -530,6 +698,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -530,6 +712,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
  #ifdef __APPLE__
      u64 sp = uc->uc_mcontext->__ss.__sp;
      int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
@@ -1340,7 +1416,7 @@ index ac98629..2346285 100644
  #else
      u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
      int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
-@@ -551,6 +722,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -551,6 +736,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      void *frames[64];
  #ifdef __APPLE__   /* (from the faulting context: a leaf function's caller is in the link register) */
      int n = walk_frames(pc, uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ss.__fp, frames, 64), from = 0;
@@ -1349,7 +1425,7 @@ index ac98629..2346285 100644
  #else
      int n = backtrace(frames, 64), from = 0;
      for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
-@@ -558,6 +731,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -558,6 +745,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
      gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
      print_frames(frames + from, n - from);
@@ -1359,7 +1435,7 @@ index ac98629..2346285 100644
      report_close(report);
      fflush(stderr);
      _exit(5);
-@@ -603,6 +779,9 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
+@@ -603,6 +793,9 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
      report_open("stopped", report, sizeof report);
      out("\n*** stopped during %s: %s\n", phase, text);
      rt_backtrace();
@@ -1369,7 +1445,7 @@ index ac98629..2346285 100644
      report_close(report);
      fflush(stderr);
      ExitProcess(3);
-@@ -906,6 +1085,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
+@@ -906,6 +1099,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
      const RtModule *mod = NULL;
      for (u32 k = 0; k < rt_nro_count && !mod; k++)
          if (!strcmp(rt_nro_modules[k]->build_id, id)) mod = rt_nro_modules[k];
@@ -1384,7 +1460,7 @@ index ac98629..2346285 100644
      if (!mod || module_count == MAX_MODULES) { ReleaseSRWLockExclusive(&lock); return 0; }
      u32 m = module_count;
      modules[m] = mod;
-@@ -1075,6 +1262,10 @@ int main(int argc, char **argv) {
+@@ -1075,6 +1276,10 @@ int main(int argc, char **argv) {
  #endif
  #ifdef __APPLE__
      mac_start(argc, argv, &dir, &options);

@@ -74,10 +74,10 @@ extern "C" void ps4_port_start() {
     // through QueryPerformanceCounter and clock_gettime: v00.09's profile had the guest main thread
     // spend a tenth of its time in those
     setenv("SSBU_CLOCK", "tsc", 0);
-    // three shader compiler threads (the runtime's default here would be two: a third of the cores):
+    // four shader compiler threads (the runtime's default here would be two: a third of the cores):
     // the game itself keeps one core busy and a little of two more, and a match's first draws wait
-    // on hundreds of shaders
-    setenv("SSBU_COMPILE_THREADS", "3", 0);
+    // on hundreds of shaders (the first thread only loads from the disk cache: v00.21)
+    setenv("SSBU_COMPILE_THREADS", "4", 0);
     // RADV's shader cache (scripts/build-mesa.sh): the GPU code of every shader, kept between runs - on
     // this CPU the driver takes about a second a shader, and a match's draws are skipped until theirs
     // are made. Mesa's single-file kind (one file and its index, appended to).
