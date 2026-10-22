@@ -31,7 +31,7 @@ index 4a4d0e2..72f666e 100644
 +void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
 +void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..6a391ac 100644
+index f685d58..abfad26 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -48,6 +48,14 @@ static u32 final_w, final_h;
@@ -94,7 +94,7 @@ index f685d58..6a391ac 100644
  static const char BLIT_HLSL[] =
      "Texture2D t : register(t0); SamplerState s : register(s0);\n"
      "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
-@@ -447,8 +486,89 @@ static const char DECODE_HLSL[] =
+@@ -447,8 +486,91 @@ static const char DECODE_HLSL[] =
      "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
      "float4 main(V i) : SV_Target { return src.Load(int4(int2(i.pos.xy), 0, 0)); }\n";
  
@@ -181,10 +181,12 @@ index f685d58..6a391ac 100644
  static void start_compilers(void);                 /* (see "shaders") */
  static DWORD WINAPI prewarm_main(void *unused);
 +static void pack_open(void);
++static void used_open(void);
++static u32 used_loaded, pack_count;
  
  /* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
   * DXVK test builds of tools/linux/wintest.py). */
-@@ -811,6 +931,16 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
+@@ -811,14 +933,27 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      if (render_scale != 1.0f)
          fprintf(stderr, "[gfx] render scale %.3g%s: the game's 1920x1080 drawn at %ux%u\n", render_scale,
                  display_render_scale() == 0 ? " (auto)" : "", pw, ph);
@@ -198,10 +200,23 @@ index f685d58..6a391ac 100644
 +                (rt_clock_ns() - t0) / 1e9, display_upscaler() == UPSCALE_FSR && fsr_cb ? "FSR 1" : "bilinear");
 +    }
 +    pack_open();
++    if (pack_count) used_open();
      start_compilers();
      /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
       * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
-@@ -999,6 +1129,105 @@ static void cache_path(const Shader *s, char *path, size_t n) {
+      * instead: the whole cache at once kept them busy for minutes and the first frame waited
+      * behind them (5,948 shaders: 600 CPU-seconds, no frame for over 30 s). So under DXVK it is
+-     * off unless SSBU_SHADER_PREWARM=1. */
++     * off unless SSBU_SHADER_PREWARM=1 - or with a pack and its used list (the PS4: DXVK makes each shader's
++     * library on the thread creating it, the prewarm's own two threads, and only the programs played here
++     * before, newest 3000: SSBU_SHADER_PREWARM_MAX). */
+     const char *prewarm = getenv("SSBU_SHADER_PREWARM");
+-    if (prewarm ? atoi(prewarm) != 0 : !on_dxvk()) CloseHandle(CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL));
++    if (prewarm ? atoi(prewarm) != 0 : !on_dxvk() || used_loaded) CloseHandle(CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL));
+     else if (!prewarm) fprintf(stderr, "[gfx] prewarm: off under DXVK (SSBU_SHADER_PREWARM=1 turns it on)\n");
+     ready = 1;
+     fprintf(stderr, "[gfx] Direct3D 11 ready%s\n", compile_dev ? " (shaders compile on a device of their own first)" : "");
+@@ -999,6 +1134,162 @@ static void cache_path(const Shader *s, char *path, size_t n) {
      shader_cache_file(path, n, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
  }
  
@@ -304,10 +319,67 @@ index f685d58..6a391ac 100644
 +    return code;
 +}
 +
++/* ---- the programs this machine's game has used: "<cache dir>-used.txt" --------------------
++ * With a pack (every program of the game, nearly all never met here) the folder's dates do not
++ * tell what was played, so each program the game uses is named in this list, once, in the order
++ * first used; the prewarm (below) makes the list's programs at the next start. */
++#define USED_SLOTS 65536
++static u64 *used_set;   /* the list's names (shader_program_hash; 0 = free) */
++static u32 used_count;
++static char (*used_names)[64];   /* (for the prewarm, read at start) */
++static u32 used_loaded, pack_count;
++static SRWLOCK used_lock = SRWLOCK_INIT;
++static FILE *used_file;
++
++/* (under used_lock, or before the compilers start) 1 if the name was not in the set */
++static int used_insert(const char *base) {
++    u64 k = shader_program_hash((const u8 *)base, (u32)strlen(base));
++    k += !k;
++    if (used_count >= USED_SLOTS / 2) return 0;
++    for (u32 i = 0; i < USED_SLOTS; i++) {
++        u64 *p = &used_set[((k * 0x9E3779B97F4A7C15ull >> 48) + i) & (USED_SLOTS - 1)];
++        if (*p == k) return 0;
++        if (!*p) { *p = k; used_count++; return 1; }
++    }
++    return 0;
++}
++
++static void used_open(void) {
++    char path[1100];
++    snprintf(path, sizeof path, "%s-used.txt", cache_dir());
++    if (!(used_set = calloc(USED_SLOTS, sizeof *used_set))) return;
++    FILE *f = fopen(path, "r");
++    char line[128];
++    u32 cap = 0;
++    while (f && fgets(line, sizeof line, f)) {
++        line[strcspn(line, "\r\n")] = 0;
++        if (!line[0] || strlen(line) >= sizeof *used_names || !used_insert(line)) continue;
++        if (used_loaded == cap) {
++            void *more = realloc(used_names, sizeof *used_names * (cap = cap * 2 + 1024));
++            if (!more) break;
++            used_names = more;
++        }
++        memcpy(used_names[used_loaded++], line, strlen(line) + 1);
++    }
++    if (f) fclose(f);
++    used_file = fopen(path, "a");
++    fprintf(stderr, "[gfx] %u shader programs used here before (%s)\n", used_loaded, path);
++}
++
++/* A program the game now has: into the list if new. */
++static void used_note(const char *path) {
++    if (!used_set) return;
++    const char *base = strrchr(path, '/');
++    base = base ? base + 1 : path;
++    AcquireSRWLockExclusive(&used_lock);
++    if (used_insert(base) && used_file) { fprintf(used_file, "%s\n", base); fflush(used_file); }
++    ReleaseSRWLockExclusive(&used_lock);
++}
++
  /* A file the ahead-of-time compiler wrote (dated 2001), now used by the game: dated now, so the
   * next start's prewarm makes it. */
  static void cache_touch(const char *path) {
-@@ -1023,14 +1252,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
+@@ -1023,14 +1314,23 @@ static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t si
   * device, which compiles right here (its object is not needed: the rendering device finds the
   * GPU code in the driver's cache - measured 3.5 ms of its time a shader instead of 190 ms),
   * then the object the draws use */
@@ -331,9 +403,12 @@ index f685d58..6a391ac 100644
      return ok;
  }
  
-@@ -1107,16 +1345,10 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+@@ -1105,18 +1405,12 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+     void *obj = NULL;
+     if (go) {
          char path[1200];
-         cache_path(s, path, sizeof path);
+-        cache_path(s, path, sizeof path);
++        if (!cache_find(s, path, sizeof path)) cache_path(s, path, sizeof path);
          me->step = STEP_CACHE;
 -        FILE *f = fopen(path, "rb");
 -        if (f) {
@@ -352,7 +427,7 @@ index f685d58..6a391ac 100644
      }
      AcquireSRWLockExclusive(&prewarm_lock);
      if (go && p->state == PW_LOADING) {
-@@ -1135,26 +1367,32 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
+@@ -1135,26 +1429,34 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
  /* (on a compiler thread) the shader's GPU code: 1 ready, 2 failed */
  static LONG make_ready(struct Compiler *me, Shader *s) {
      char path[1200];
@@ -376,7 +451,8 @@ index f685d58..6a391ac 100644
 +        int ok = create_noted(me, s, cached, n);
 +        free(cached);
 +        if (ok) {
-+            if (!pack_find(path)) cache_touch(path);   /* (the pack's are not dated: the prewarm reads the folder) */
++            if (!pack_find(path)) cache_touch(path);   /* (the pack's are not dated: the used list names them) */
++            used_note(path);
 +            return 1;
 +        }
      }
@@ -394,10 +470,35 @@ index f685d58..6a391ac 100644
 +        /* by name: what the next shader pack is to have (a draw with it was skipped meanwhile) */
 +        const char *base = strrchr(path, '/');
 +        fprintf(stderr, "[gfx] %s: not in the shader cache, compiled from HLSL in %.1f s\n", base ? base + 1 : path, compile_ns / 1e9);
++        used_note(path);
          state = 1;
      } else {
          fprintf(stderr, "[gfx] shader %s failed to compile:\n%.2000s\n", s->name,
-@@ -1474,8 +1712,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+@@ -1231,6 +1533,15 @@ static DWORD WINAPI prewarm_main(void *unused) {
+     SetThreadDescription(GetCurrentThread(), L"shader prewarm");
+     Found *found = NULL;
+     u32 n = 0, cap = 0;
++    if (used_set) {   /* with a pack: the used list, in the order first used, its newest PREWARM_MAX */
++        const char *env = getenv("SSBU_SHADER_PREWARM_MAX");
++        u32 max = env ? (u32)atoi(env) : 3000, first = used_loaded > max ? used_loaded - max : 0;
++        if (used_loaded > first) found = calloc(used_loaded - first, sizeof *found);
++        for (u32 i = first; found && i < used_loaded; i++) snprintf(found[n++].name, sizeof found->name, "%s", used_names[i]);
++        free(used_names);
++        used_names = NULL;
++        goto listed;
++    }
+     char pattern[1100];
+     snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", cache_dir(), SHADER_CACHE_VERSION);
+     WIN32_FIND_DATAA fd;
+@@ -1244,6 +1555,7 @@ static DWORD WINAPI prewarm_main(void *unused) {
+     }
+     if (h != INVALID_HANDLE_VALUE) FindClose(h);
+     qsort(found, n, sizeof *found, newest_first);   /* the shaders of what was played last, first */
++listed:
+     prewarm_t0 = GetTickCount64();
+     prewarm_bytes0 = private_bytes();
+     Prewarm *table = calloc(PREWARM_SLOTS, sizeof *table);
+@@ -1474,8 +1786,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
          return s;
      }
      char path[1200];
@@ -407,7 +508,7 @@ index f685d58..6a391ac 100644
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
       * leaves its outputs (skinned vertices) unwritten for a frame */
-@@ -4346,6 +4583,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4346,6 +4657,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
          ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
          ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -438,7 +539,7 @@ index f685d58..6a391ac 100644
      } else {   /* as big as its place or smaller: drawn bilinear */
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
          ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-@@ -4453,12 +4714,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4453,12 +4788,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                   profile_running() ? "  (profiling...)" : "");
          char net[512];
          net_status(net, sizeof net);
