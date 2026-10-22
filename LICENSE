@@ -1,6 +1,5 @@
 MIT License
 
-Copyright (c) 2026 BelmanteGu (Super Mario Bros. Wonder Recomp, the recompiler and runtime)
 Copyright (c) 2026 ShiroKlein (the PS4 port)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -22,4 +21,5 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 The license covers this project's code only. It grants nothing for Nintendo's game: no game code, assets or
-keys are part of this project. Third-party components keep their own licenses (see CREDITS.md).
+keys are part of this project. The patches in patches/ change other projects (WindowSmash, DXVK, Mesa); those
+projects and the other third-party components keep their own terms (see CREDITS.md).
