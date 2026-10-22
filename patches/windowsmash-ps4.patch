@@ -60,7 +60,7 @@ index 4a4d0e2..72f666e 100644
 +void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
 +void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..677d0e9 100644
+index f685d58..06bc863 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -48,6 +48,14 @@ static u32 final_w, final_h;
@@ -564,7 +564,127 @@ index f685d58..677d0e9 100644
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
       * leaves its outputs (skinned vertices) unwritten for a frame */
-@@ -4346,6 +4661,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -1731,6 +2046,99 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
+     return u->srv;
+ }
+ 
++/* ---- vertex pools: big vertex streams kept on the GPU ------------------------------------
++ * A stream's size runs to its limit register, and the game points many draws into one pool of
++ * vertex data with the pool's end as their limit: each draw's stream is from its own start to that
++ * end. Sent whole for every draw, that was ~270 KB a draw and 1.9 GB a frame on the screens after
++ * a match (1 fps). A pool is sent once - again only when its bytes change - and each draw gets a
++ * view into it at the 4 KiB step at or before its start, the rest of the way added to its
++ * attributes' offsets (as resident_view does). */
++#define POOLS 16
++#define POOL_MAX (4u << 20)
++#define POOL_STEP 4096u
++typedef struct { u64 base, end, guest; u32 bytes, cap; ID3D11Buffer *buf; ID3D11ShaderResourceView **views; u8 *copy; u64 batch, seq, used; } Pool;
++static Pool pools[POOLS];
++static u64 pool_clock;
++
++static void pool_views_drop(Pool *p) {
++    for (u32 k = 0; p->views && k < p->cap / POOL_STEP; k++)
++        if (p->views[k]) { ID3D11ShaderResourceView_Release(p->views[k]); p->views[k] = NULL; }
++}
++
++static void pool_free(Pool *p) {
++    pool_views_drop(p);
++    if (p->buf) ID3D11Buffer_Release(p->buf);
++    free(p->views);
++    free(p->copy);
++    memset(p, 0, sizeof *p);
++}
++
++/* A view of the pool holding the stream [va, va + size) and how far into it the stream starts
++ * (*skip); NULL for a stream that is not big, or not in one mapping. */
++static ID3D11ShaderResourceView *upload_pool(u64 va, u32 size, u32 *skip) {
++    if (size <= REUSE_MAX || size > POOL_MAX) return NULL;
++    u64 end = va + size, base = va & ~(u64)(POOL_STEP - 1);
++    u64 g = gpu_va_to_guest(base);
++    if (!g || gpu_va_to_guest(end - 1) != g + (end - 1 - base)) return NULL;
++    Pool *p = NULL, *old = &pools[0];
++    for (u32 i = 0; i < POOLS; i++) {
++        if (pools[i].buf && pools[i].end == end) { p = &pools[i]; break; }
++        if (pools[i].used < old->used) old = &pools[i];
++    }
++    pool_clock++;
++    /* a new pool; or one met from further down (it grows to there), or now mapped elsewhere */
++    int send = !p || base < p->base || gpu_va_to_guest(p->base) != p->guest;
++    if (!p) p = old;
++    if (send) {
++        u64 lo = p->buf && p->end == end && p->base < base ? p->base : base;
++        u64 glo = gpu_va_to_guest(lo);
++        if (!glo || gpu_va_to_guest(end - 1) != glo + (end - 1 - lo)) { p->end = 0; return NULL; }
++        u32 bytes = (u32)(end - lo);
++        if (p->cap < bytes) {
++            pool_free(p);
++            u32 cap = 1u << 17;
++            while (cap < bytes) cap *= 2;
++            D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
++                                    D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
++            if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &p->buf))) { p->buf = NULL; return NULL; }
++            p->views = calloc(cap / POOL_STEP, sizeof *p->views);
++            p->copy = malloc(cap);
++            p->cap = cap;
++            if (!p->views || !p->copy) { pool_free(p); return NULL; }
++        } else pool_views_drop(p);   /* (their places are from the old base) */
++        p->base = lo; p->end = end; p->guest = glo; p->bytes = bytes;
++    }
++    p->used = pool_clock;
++    const u8 *src = P(const u8, p->guest);
++    if (send || !untouched_since(p->batch, p->seq, p->guest, p->bytes)) {
++        if (!send) gfx_stat_reuse_compared += p->bytes;
++        if (send || memcmp(src, p->copy, p->bytes)) {
++            D3D11_MAPPED_SUBRESOURCE m;
++            if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)p->buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { p->end = 0; return NULL; }
++            memcpy(p->copy, src, p->bytes);
++            memcpy(m.pData, p->copy, p->bytes);
++            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)p->buf, 0);
++            gfx_stat_upload_bytes += p->bytes;
++            gfx_stat_upload_kind[1] += p->bytes;
++        } else gfx_stat_reused++;
++        p->batch = gpu_stat_batches;
++        p->seq = wrote_seq;
++    } else gfx_stat_reused++;
++    u32 k = (u32)((base - p->base) / POOL_STEP);
++    if (!p->views[k]) {
++        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
++        memset(&sd, 0, sizeof sd);
++        sd.Format = DXGI_FORMAT_R32_TYPELESS;
++        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
++        sd.BufferEx.FirstElement = k * (POOL_STEP / 4);
++        sd.BufferEx.NumElements = (p->cap - k * POOL_STEP) / 4;
++        sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
++        if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)p->buf, &sd, &p->views[k]))) { p->views[k] = NULL; return NULL; }
++    }
++    *skip = (u32)(va - base);
++    return p->views[k];
++}
++
+ static ID3D11Buffer *params_buffer, *index_buffer;
+ static u32 index_cap, index_pos, index_first;   /* the index ring: its size, where the next indices go, where this draw's start (in indices) */
+ static DrawParams params_written;   /* what params_buffer holds (a draw with the same parameters writes nothing) */
+@@ -3457,7 +3865,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
+         }
+         stream_skip[j] = 0;
+         Resident *part = resident_overlapping_gpu(start, (u32)size);
+-        if (!part && !draw_logging) { vsrv[n] = stream_srv[j] = upload_gpu(SHADER_VERTEX, 18 + n, start, (u32)size); continue; }
++        if (!part && !draw_logging) {
++            u32 skip = 0;
++            ID3D11ShaderResourceView *pv = upload_pool(start, (u32)size, &skip);
++            if (pv && off + skip <= 0x3FFF) {   /* (a view of the pool: from the step before the stream) */
++                vsrv[n] = stream_srv[j] = pv;
++                stream_skip[j] = skip;
++                params.attr[n][0] = fmt + (skip << 7);
++                continue;
++            }
++            vsrv[n] = stream_srv[j] = upload_gpu(SHADER_VERTEX, 18 + n, start, (u32)size);
++            continue;
++        }
+         if (size > stream_cap) { stream_data = realloc(stream_data, size + 16); stream_cap = (u32)size; }
+         read_gpu(start, (u32)size, stream_data);
+         vsrv[n] = stream_srv[j] = part ? upload_composed(SHADER_VERTEX, 18 + n, start, stream_data, (u32)size) : NULL;
+@@ -4346,6 +4765,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
          ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
          ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -595,7 +715,7 @@ index f685d58..677d0e9 100644
      } else {   /* as big as its place or smaller: drawn bilinear */
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
          ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-@@ -4453,12 +4792,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4453,12 +4896,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                   profile_running() ? "  (profiling...)" : "");
          char net[512];
          net_status(net, sizeof net);

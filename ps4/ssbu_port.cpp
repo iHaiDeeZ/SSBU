@@ -58,8 +58,11 @@ extern "C" void ps4_port_start() {
     setenv("DXVK_SHADER_CACHE_PATH", "/data/SSBU/dxvk", 1);
     // Pipelines only ever fast-linked from each shader's library: without this DXVK compiles every
     // pipeline a second time, whole and optimised, on its workers - on this CPU that kept two cores
-    // busy for minutes once a match began. (dxvk.conf's lines come on top.)
-    setenv("DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary = True", 0);
+    // busy for minutes once a match began. And no memory defragmentation: every half second DXVK's
+    // allocator moved resources around under the lock the renderer's buffer renames wait on (the
+    // renderer waited on it ~13% of its time in v00.18's busy match; the PS4's memory is one pool
+    // anyway). (dxvk.conf's lines come on top.)
+    setenv("DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary = True; dxvk.enableMemoryDefrag = False", 0);
     // the renderer's details (frame times, draws, uploads, shaders compiling) in the log every 5 s
     setenv("SSBU_LOG_STATS", "1", 0);
     // Profiles only when asked for (L3+R3; SSBU_AUTO_PROFILE=1 in env.txt: also when the frame rate
