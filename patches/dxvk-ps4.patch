@@ -217,6 +217,71 @@ index a9ed5e7..420fa6a 100644
    pkg.generate(dxgi_dll,
      filebase: dxvk_pkg_prefix + 'dxgi',
      subdirs:  'dxvk',
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index 2c5334d..262cfc9 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -3,6 +3,8 @@
+ #include "../util/util_time.h"
+ 
+ #include "dxvk_device.h"
++#include <cstdio>
++
+ #include "dxvk_graphics.h"
+ #include "dxvk_pipemanager.h"
+ 
+@@ -1100,6 +1102,19 @@ namespace dxvk {
+         // Keep pipeline object locked, at worst we're going to stall
+         // a state cache worker and the current thread needs priority.
+         bool canCreateBasePipeline = this->canCreateBasePipeline(state);
++#ifdef DXVK_PS4
++        // PS4 (SSBU port): a state the libraries cannot be fast-linked for needs the whole pipeline
++        // compiled, which takes up to seconds on this CPU - done here, on the CS thread, every frame
++        // waited for it (the 5 s freezes of v00.22/v00.23, presents stuck behind it). It is compiled
++        // on a worker instead (compilePipeline below), and draws with it are skipped until then.
++        if (!canCreateBasePipeline && m_device->config().enableGraphicsPipelineLibrary == Tristate::True) {
++          instance = m_pipelines.add(state, VK_NULL_HANDLE, VK_NULL_HANDLE, computeAttachmentMask(state));
++          m_stats->numGraphicsPipelines += 1;
++          lock.unlock();
++          m_workers->compileGraphicsPipeline(this, state, DxvkPipelinePriority::High);
++          return instance->getHandle();
++        }
++#endif
+         instance = this->createInstance(state, canCreateBasePipeline);
+ 
+         // Unlock here since we may dispatch the pipeline to a worker,
+@@ -1118,8 +1133,30 @@ namespace dxvk {
+ 
+   void DxvkGraphicsPipeline::compilePipeline(
+     const DxvkGraphicsPipelineStateInfo& state) {
+-    if (m_device->config().enableGraphicsPipelineLibrary == Tristate::True)
++    if (m_device->config().enableGraphicsPipelineLibrary == Tristate::True) {
++#ifdef DXVK_PS4
++      // (the pipelines getPipelineHandle left to the workers: no fast link for their state)
++      DxvkGraphicsPipelineInstance* pending = this->findInstance(state);
++
++      if (pending && !pending->baseHandle.load() && !pending->fastHandle.load()
++       && !pending->isCompiling.exchange(VK_TRUE)) {
++        auto t0 = dxvk::high_resolution_clock::now();
++        VkPipeline pipeline = this->getOptimizedPipeline(state);
++        pending->fastHandle.store(pipeline);
++        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(dxvk::high_resolution_clock::now() - t0).count();
++        static std::atomic<uint32_t> told = { 0u };
++        if (told++ < 40u) {
++          std::fprintf(stderr, "dxvk: a pipeline without a fast link (vs %s) compiled on a worker in %lld ms\n",
++            m_shaders.vs != nullptr ? m_shaders.vs->debugName().c_str() : "?", (long long)ms);
++          if (told.load() <= 3u)
++            this->logPipelineState(LogLevel::Info, state);
++        }
++        if (!pipeline)
++          this->logPipelineState(LogLevel::Error, state);
++      }
++#endif
+       return;
++    }
+ 
+     // Try to find an existing instance that contains a base pipeline
+     DxvkGraphicsPipelineInstance* instance = this->findInstance(state);
 diff --git a/src/dxvk/dxvk_pipemanager.cpp b/src/dxvk/dxvk_pipemanager.cpp
 index c1507b4..371a2eb 100644
 --- a/src/dxvk/dxvk_pipemanager.cpp

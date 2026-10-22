@@ -44,10 +44,26 @@ mkdir -p "$STAGE/sce_sys"
 cp "$EBOOT" "$STAGE/eboot.bin"
 python3 "$HERE/make-art.py" "$STAGE/sce_sys"
 echo "$VERSION" > "$STAGE/version.txt"
+# SSBU_WITH_DATA=1: the game's data in the package too (~23 GB): dump/ as scripts/stage-data.sh stages it, its
+# romfs.cfg naming /app0/data, the NROs as built now, and the shader packs (DXBC, DXVK, Mesa). The runtime reads
+# dump/ from /app0/data when it is there (runtime/ps4/start.c) and copies the DXVK and Mesa packs out once
+# (ps4/ssbu_port.cpp). Hard links: nothing is copied here.
+if [ "${SSBU_WITH_DATA:-0}" = 1 ]; then
+    DATA="$PS4_BUILD_ROOT/data-stage/SSBU/dump"
+    PACKS="$PS4_BUILD_ROOT/shaderpack/stage"
+    mkdir -p "$STAGE/data/dump/modules" "$STAGE/data/dump/nro" "$STAGE/data/dump/fonts"
+    for f in "$DATA/modules/"*; do [ "$(basename "$f")" = romfs.cfg ] || ln "$f" "$STAGE/data/dump/modules/"; done
+    sed 's#/data/SSBU/#/app0/data/#g' "$DATA/modules/romfs.cfg" > "$STAGE/data/dump/modules/romfs.cfg"
+    ln "$OBJ/nro-so/"*.so "$STAGE/data/dump/nro/"
+    ln "$DATA/fonts/"* "$STAGE/data/dump/fonts/"
+    ln "$PACKS/dump/shadercache.pak" "$STAGE/data/dump/"
+    cp -al "$PACKS/dxvk" "$PACKS/mesa" "$STAGE/data/"
+    echo "with the game's data: $(du -sh --apparent-size "$STAGE/data" | cut -f1)"
+fi
 find "$STAGE" -type d -empty -delete
 PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR=/nonexistent "$HERE/make-pkg.sh" "$STAGE" SSBU00001 "Smash Ultimate (SSBU)" "$VERSION" SSBURECOMPPS4 "$PS4_BUILD_ROOT/out" | tail -1)"
 mkdir -p "$HERE/../out" "$PS4_BUILD_ROOT/oelf"
-NAME="SSBU-v$VERSION.pkg"
+NAME="SSBU-v$VERSION$([ "${SSBU_WITH_DATA:-0}" = 1 ] && echo -full).pkg"
 cp "$PKG" "$HERE/../out/$NAME"
 cp "$BUILD/eboot_eboot/eboot.oelf" "$PS4_BUILD_ROOT/oelf/v$VERSION.oelf"
 cp "$BUILD/eboot" "$PS4_BUILD_ROOT/oelf/v$VERSION.elf"

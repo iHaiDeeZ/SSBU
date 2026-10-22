@@ -5,9 +5,38 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <sys/stat.h>
 
 #include "../port/ps4_vk_wsi.h"
+
+// /app0/data/<rel> to /data/SSBU/<rel>, when the package has it and the tree does not (its folders made)
+static void seed_from_package(const char* rel) {
+    const std::string from = std::string("/app0/data/") + rel, to = std::string("/data/SSBU/") + rel;
+    struct stat st;
+    if (stat(to.c_str(), &st) == 0 || stat(from.c_str(), &st) != 0)
+        return;
+    for (size_t at = to.find('/', 1); at != std::string::npos; at = to.find('/', at + 1))
+        mkdir(to.substr(0, at).c_str(), 0777);
+    const std::string part = to + ".part";
+    std::FILE* in = std::fopen(from.c_str(), "rb");
+    std::FILE* out = in ? std::fopen(part.c_str(), "wb") : nullptr;
+    static char buf[4 << 20];
+    size_t n, total = 0;
+    bool ok = in && out;
+    while (ok && (n = std::fread(buf, 1, sizeof buf, in)) > 0) {
+        ok = std::fwrite(buf, 1, n, out) == n;
+        total += n;
+    }
+    if (in) std::fclose(in);
+    if (out && std::fclose(out) != 0) ok = false;
+    if (ok && std::rename(part.c_str(), to.c_str()) == 0)
+        std::fprintf(stderr, "[boot] %s: %zu MiB copied from the package\n", to.c_str(), total >> 20);
+    else {
+        std::remove(part.c_str());
+        std::fprintf(stderr, "[boot] %s: could not copy it from the package\n", to.c_str());
+    }
+}
 
 extern "C" void ps4_boot_trace(const char* stage);  // port/ps4_crashlog.cpp
 extern "C" void ps4_profile_thread_begin();         // port/ps4_profile.cpp
@@ -82,6 +111,12 @@ extern "C" void ps4_port_start() {
     // this CPU the driver takes about a second a shader, and a match's draws are skipped until theirs
     // are made. Mesa's single-file kind (one file and its index, appended to).
     mkdir("/data/SSBU/mesa", 0777);
+    // A package made with the game's data (build-ssbu.sh SSBU_WITH_DATA=1) also carries the shader packs; the
+    // two DXVK and Mesa read in their cache folders (DXVK's is written to as well) are copied out, once.
+    seed_from_package("dxvk/cdc70b6c9a46842e.dxvk.bin");
+    seed_from_package("dxvk/cdc70b6c9a46842e.dxvk.lut");
+    seed_from_package("mesa/mesa_shader_cache_sf/6fe5553f10e654082681c2904579a9f0/AMD RADV BONAIRE/ssbu_pack.foz");
+    seed_from_package("mesa/mesa_shader_cache_sf/6fe5553f10e654082681c2904579a9f0/AMD RADV BONAIRE/ssbu_pack_idx.foz");
     setenv("MESA_SHADER_CACHE_DIR", "/data/SSBU/mesa", 0);
     setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0);
     // and the shader pack made on the PC (scripts/build-shaderpack.sh: every shader of the game, compiled by the same

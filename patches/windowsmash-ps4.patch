@@ -3388,10 +3388,10 @@ index 0000000..7af2f12
 +}
 diff --git a/runtime/ps4/start.c b/runtime/ps4/start.c
 new file mode 100644
-index 0000000..0f7a3b6
+index 0000000..d46985f
 --- /dev/null
 +++ b/runtime/ps4/start.c
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,60 @@
 +/* The PS4's start (host.c main, as mac_start on macOS): an eboot gets no arguments and starts in
 + * /app0, so the game's tree is /data/SSBU - dump/modules (the module images, romfs.cfg, aoc.cfg),
 + * dump/fonts, save/, reports/, screenshots/, the *.txt and *.ini settings - and the working
@@ -3410,14 +3410,31 @@ index 0000000..0f7a3b6
 +
 +__attribute__((weak)) void ps4_port_start(void);
 +
-+/* (ps4_compat.h) a relative path as the tree's: the PS4 resolves no relative path */
++/* The game's data inside the package, when it was made with it (the SSBU port's build-ssbu.sh
++ * SSBU_WITH_DATA=1): /app0/data holds dump/ as the tree has it (romfs.cfg naming /app0/data). */
++#define APP_DATA "/app0/data"
++static int app_data = -1;
++
++/* (ps4_compat.h) a relative path as the tree's: the PS4 resolves no relative path. A file of dump/
++ * the package has is read from there; everything else (what is written: caches, saves, logs) is
++ * the tree's. */
 +const char *rt_ps4_path(const char *path) {
 +    static __thread char bufs[4][1024];
 +    static __thread unsigned next;
 +    if (!path || path[0] == '/') return path;
 +    while (path[0] == '.' && path[1] == '/') path += 2;
 +    char *buf = bufs[next++ % 4];
-+    snprintf(buf, sizeof bufs[0], TREE "/%s", strcmp(path, ".") ? path : "");
++    const char *rel = strcmp(path, ".") ? path : "";
++    if (app_data < 0) {
++        struct stat st;
++        app_data = stat(APP_DATA "/dump/modules/romfs.cfg", &st) == 0;
++    }
++    if (app_data && !strncmp(rel, "dump/", 5)) {
++        struct stat st;
++        snprintf(buf, sizeof bufs[0], APP_DATA "/%s", rel);
++        if (stat(buf, &st) == 0) return buf;
++    }
++    snprintf(buf, sizeof bufs[0], TREE "/%s", rel);
 +    return buf;
 +}
 +
