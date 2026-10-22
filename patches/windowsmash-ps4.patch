@@ -1,3 +1,32 @@
+diff --git a/runtime/debug_watchdog.c b/runtime/debug_watchdog.c
+index 2fc9e3f..fbd967f 100644
+--- a/runtime/debug_watchdog.c
++++ b/runtime/debug_watchdog.c
+@@ -26,6 +26,11 @@ void kernel_thread_states(void (*line)(const char *text));
+ void rt_report_path(char *path, size_t n, const char *kind, const char *ext);
+ int rt_write_dump(const char *path, DWORD tid, EXCEPTION_POINTERS *e, DWORD wait_ms);
+ 
++#ifdef __ORBIS__
++int ps4_watchdog_setprio(void *thread, int prio) __asm__("scePthreadSetprio");
++void *ps4_watchdog_self(void) __asm__("scePthreadSelf");
++#endif
++
+ static volatile U64 last_present;
+ static volatile U64 presented;
+ static volatile LONG paused, started = -1;
+@@ -65,6 +70,12 @@ static void write_report(U64 since, int first) {
+ static DWORD WINAPI watchdog(void *unused) {
+     (void)unused;
+     SetThreadDescription(GetCurrentThread(), L"freeze watchdog");
++#ifdef __ORBIS__
++    /* above the game's threads (all 700): libkernel always runs a higher priority first, so threads
++     * spinning at 700 on every core still leave it its turn (v00.20 froze with no report at all).
++     * It sleeps between its looks. */
++    ps4_watchdog_setprio(ps4_watchdog_self(), 600);
++#endif
+     static const U64 AT[] = {5000, 30000, 120000};
+     int reports = 0;
+     for (;;) {
 diff --git a/runtime/display.h b/runtime/display.h
 index 4a4d0e2..72f666e 100644
 --- a/runtime/display.h
@@ -31,7 +60,7 @@ index 4a4d0e2..72f666e 100644
 +void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
 +void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..abfad26 100644
+index f685d58..677d0e9 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -48,6 +48,14 @@ static u32 final_w, final_h;
@@ -474,7 +503,25 @@ index f685d58..abfad26 100644
          state = 1;
      } else {
          fprintf(stderr, "[gfx] shader %s failed to compile:\n%.2000s\n", s->name,
-@@ -1231,6 +1533,15 @@ static DWORD WINAPI prewarm_main(void *unused) {
+@@ -1173,11 +1475,15 @@ static DWORD WINAPI compiler_main(void *arg) {
+     ULONG guarantee = 64 << 10;   /* room for the crash report, should a compile overflow even this stack */
+     SetThreadStackGuarantee(&guarantee);
+     int prewarms = me != &compilers[0];
++    /* and with three or more, the first keeps to loads from the disk cache (quick): compiles from HLSL
++     * take seconds each (up to 21 s on the PS4), and with every thread on one, a compute program's load
++     * that its draw waits for waited its whole 250 ms, frame after frame (v00.20: 6 fps at a match's start) */
++    int compiles = prewarms || ncompilers < 3;
+     for (;;) {
+         AcquireSRWLockExclusive(&jobs_lock);
+-        while (!job_queue[0].head && !job_queue[1].head && !(prewarms && job_queue[2].head))
++        while (!job_queue[0].head && !(compiles && job_queue[1].head) && !(prewarms && job_queue[2].head))
+             SleepConditionVariableSRW(&jobs_cv, &jobs_lock, INFINITE, 0);
+-        int q = job_queue[0].head ? 0 : job_queue[1].head ? 1 : 2;
++        int q = job_queue[0].head ? 0 : compiles && job_queue[1].head ? 1 : 2;
+         Shader *s = job_queue[q].head;
+         if (!(job_queue[q].head = s->next_job)) job_queue[q].tail = NULL;
+         ReleaseSRWLockExclusive(&jobs_lock);
+@@ -1231,6 +1537,15 @@ static DWORD WINAPI prewarm_main(void *unused) {
      SetThreadDescription(GetCurrentThread(), L"shader prewarm");
      Found *found = NULL;
      u32 n = 0, cap = 0;
@@ -490,7 +537,7 @@ index f685d58..abfad26 100644
      char pattern[1100];
      snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", cache_dir(), SHADER_CACHE_VERSION);
      WIN32_FIND_DATAA fd;
-@@ -1244,6 +1555,7 @@ static DWORD WINAPI prewarm_main(void *unused) {
+@@ -1244,6 +1559,7 @@ static DWORD WINAPI prewarm_main(void *unused) {
      }
      if (h != INVALID_HANDLE_VALUE) FindClose(h);
      qsort(found, n, sizeof *found, newest_first);   /* the shaders of what was played last, first */
@@ -498,7 +545,16 @@ index f685d58..abfad26 100644
      prewarm_t0 = GetTickCount64();
      prewarm_bytes0 = private_bytes();
      Prewarm *table = calloc(PREWARM_SLOTS, sizeof *table);
-@@ -1474,8 +1786,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+@@ -1298,7 +1614,7 @@ static void enqueue_shader(Shader *s) {
+         job_queue[q].tail = s;
+     }
+     ReleaseSRWLockExclusive(&jobs_lock);
+-    WakeConditionVariable(&jobs_cv);
++    WakeAllConditionVariable(&jobs_cv);   /* (all: the one woken may be the first, which leaves compiles) */
+ }
+ 
+ /* For a crash or freeze report: what each compiler thread is doing (to line, a line at a time),
+@@ -1474,8 +1790,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
          return s;
      }
      char path[1200];
@@ -508,7 +564,7 @@ index f685d58..abfad26 100644
      enqueue_shader(s);
      /* a compute program that was compiled before is waited for (a few ms): a skipped launch
       * leaves its outputs (skinned vertices) unwritten for a frame */
-@@ -4346,6 +4657,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4346,6 +4661,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
          ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
          ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -539,7 +595,7 @@ index f685d58..abfad26 100644
      } else {   /* as big as its place or smaller: drawn bilinear */
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
          ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-@@ -4453,12 +4788,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4453,12 +4792,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                   profile_running() ? "  (profiling...)" : "");
          char net[512];
          net_status(net, sizeof net);

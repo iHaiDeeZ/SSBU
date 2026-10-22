@@ -85,10 +85,10 @@ extern "C" void ps4_port_start() {
     // RADV for this GPU), ssbu_pack.foz and ssbu_pack_idx.foz next to that cache's own files, read-only: a shader the
     // game meets for the first time is then read, not compiled. (Mesa leaves out a pack that is not there.)
     setenv("MESA_DISK_CACHE_READ_ONLY_FOZ_DBS", "ssbu_pack", 0);
-    // The 7th core, when the system grants it (it shares it): new threads may run on it too.
-    // SSBU_SEVENTH_CORE=0 keeps to six. (Off v00.15-v00.19: v00.14, the first build with it, crashed
-    // loading a match - the lazy memory's map-then-zero race, fixed in v00.17, which any timing hit.)
-    if (const char* want = std::getenv("SSBU_SEVENTH_CORE"); !want || std::atoi(want) != 0) {
+    // The 7th core, when the system grants it (it shares it) and SSBU_SEVENTH_CORE=1 asks for it:
+    // new threads may run on it too. Off: v00.14 crashed with it (the lazy memory race, fixed in
+    // v00.17), and v00.20, on by default, froze in its first match with no freeze report.
+    if (const char* want = std::getenv("SSBU_SEVENTH_CORE"); want && std::atoi(want) != 0) {
         void* self = scePthreadSelf();
         uint64_t had = 0, got = 0;
         scePthreadGetaffinity(self, &had);
@@ -99,7 +99,7 @@ extern "C" void ps4_port_start() {
         std::fprintf(stderr, "[boot] cores: %s; new threads on %#llx\n", seventh ? "7, the 7th granted" : "6 (the 7th refused)",
                      static_cast<unsigned long long>(ps4_new_thread_cores));
     } else {
-        std::fprintf(stderr, "[boot] cores: 6 (SSBU_SEVENTH_CORE=0); new threads on %#llx\n",
+        std::fprintf(stderr, "[boot] cores: 6 (SSBU_SEVENTH_CORE=1 for the 7th); new threads on %#llx\n",
                      static_cast<unsigned long long>(ps4_new_thread_cores));
     }
     ps4_profile_thread_begin();   // (the main thread: the others from their start)
