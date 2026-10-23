@@ -23,7 +23,7 @@ for try in 1 2 3; do
     settled && break
     echo "console: $NAME didn't stay, uploading again"
 done
-for old in $(listing | grep -E '^(SSBU-v[0-9.]+|IV0000-SSBU00001_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
+for old in $(listing | grep -E '^(SSBU-v[0-9.]+(-full)?|IV0000-SSBU00001_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
     if curl -sS "$HOST/" -Q "DELE /data/pkg/$old" > /dev/null; then echo "console: removed old $old"; else echo "console: could not remove $old"; fi
     sleep 15
 done
