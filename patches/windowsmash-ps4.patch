@@ -1110,6 +1110,23 @@ index dd10ed6..4d45f33 100644
          else enabled = 0;
      }
      fprintf(stderr, "[gpu] %s\n", enabled ? "submissions run on the GPU thread" : "submissions run in the submitting thread (SSBU_GPU_THREAD=0)");
+diff --git a/runtime/hle_fs.c b/runtime/hle_fs.c
+index f18f4ae..21bf291 100644
+--- a/runtime/hle_fs.c
++++ b/runtime/hle_fs.c
+@@ -265,7 +265,11 @@ HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
+     u64 uid[2] = {ld64(c->x[1]), ld64(c->x[1] + 8)};
+     account_save_id(uid);   /* (a netplay install's own id keeps the usual save) */
+     snprintf(leaf, sizeof leaf, "save/%016llx%016llx", uid[0], uid[1]);
+-    c->x[0] = add_mount(P(char, c->x[0]), M_HOST, data_root(root, sizeof root, leaf));
++    const char *name = P(char, c->x[0]);
++    c->x[0] = add_mount(name, M_HOST, data_root(root, sizeof root, leaf));
++    DWORD a = GetFileAttributesA(root);   /* (in the log: a save that cannot be reached loses everything quietly) */
++    fprintf(stderr, "[fs] save data %s: in %s, %s\n", name, root,
++            a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) ? "ready" : "NOT reachable: nothing will be saved");
+ }
+ HLE(_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE) { ready(); c->x[0] = 0; }
+ HLE(_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE) { ready(); c->x[0] = 1; }
 diff --git a/runtime/hle_pad.c b/runtime/hle_pad.c
 index e822de7..e498d1a 100644
 --- a/runtime/hle_pad.c
@@ -3388,10 +3405,10 @@ index 0000000..7af2f12
 +}
 diff --git a/runtime/ps4/start.c b/runtime/ps4/start.c
 new file mode 100644
-index 0000000..d46985f
+index 0000000..e30ea55
 --- /dev/null
 +++ b/runtime/ps4/start.c
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,89 @@
 +/* The PS4's start (host.c main, as mac_start on macOS): an eboot gets no arguments and starts in
 + * /app0, so the game's tree is /data/SSBU - dump/modules (the module images, romfs.cfg, aoc.cfg),
 + * dump/fonts, save/, reports/, screenshots/, the *.txt and *.ini settings - and the working
@@ -3415,16 +3432,44 @@ index 0000000..d46985f
 +#define APP_DATA "/app0/data"
 +static int app_data = -1;
 +
++/* A relative path with its "." and ".." taken out, as text (either slash): the kernel walks ".."
++ * only through folders that exist, and the runtime names its folders from dump/modules - the save
++ * is dump/modules/../../save/<user> (hle_fs.c), the shader cache dump/modules/../shadercache - so
++ * with the game's data in the package, where /data/SSBU/dump/modules need not exist, every save
++ * read and write failed: the game started as on its first day each time. */
++static void tidy_path(char *out, size_t n, const char *path) {
++    size_t len = 0;
++    while (*path) {
++        const char *end = path;
++        while (*end && *end != '/' && *end != '\\') end++;
++        size_t part = (size_t)(end - path);
++        size_t last = len;
++        while (last && out[last - 1] != '/') last--;
++        if (part == 2 && path[0] == '.' && path[1] == '.' && len && strcmp(out + last, "..") != 0) {
++            len = last ? last - 1 : 0;   /* (back over the last part, and its slash) */
++            out[len] = 0;
++        } else if (part && !(part == 1 && path[0] == '.') && len + (len ? 1 : 0) + part < n) {
++            if (len) out[len++] = '/';
++            memcpy(out + len, path, part);
++            len += part;
++            out[len] = 0;
++        }
++        path = *end ? end + 1 : end;
++    }
++    out[len] = 0;
++}
++
 +/* (ps4_compat.h) a relative path as the tree's: the PS4 resolves no relative path. A file of dump/
 + * the package has is read from there; everything else (what is written: caches, saves, logs) is
 + * the tree's. */
 +const char *rt_ps4_path(const char *path) {
-+    static __thread char bufs[4][1024];
++    static __thread char bufs[4][1024], tidy[1024];
 +    static __thread unsigned next;
 +    if (!path || path[0] == '/') return path;
-+    while (path[0] == '.' && path[1] == '/') path += 2;
 +    char *buf = bufs[next++ % 4];
-+    const char *rel = strcmp(path, ".") ? path : "";
++    tidy[0] = 0;
++    tidy_path(tidy, sizeof tidy, path);
++    const char *rel = tidy;
 +    if (app_data < 0) {
 +        struct stat st;
 +        app_data = stat(APP_DATA "/dump/modules/romfs.cfg", &st) == 0;
@@ -3446,6 +3491,7 @@ index 0000000..d46985f
 +    setvbuf(stderr, NULL, _IONBF, 0);
 +    if (chdir(TREE)) fprintf(stderr, "[boot] cannot work in %s\n", TREE);
 +    mkdir(TREE "/save", 0777);
++    mkdir(TREE "/dump", 0777);   /* (the shader cache's own files: with the data in the package, nothing else makes it) */
 +    mkdir(TREE "/reports", 0777);
 +    mkdir(TREE "/screenshots", 0777);
 +    if (ps4_port_start) ps4_port_start();

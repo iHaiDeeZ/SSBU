@@ -63,7 +63,7 @@ fi
 find "$STAGE" -type d -empty -delete
 PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR=/nonexistent "$HERE/make-pkg.sh" "$STAGE" SSBU00001 "Smash Ultimate (SSBU)" "$VERSION" SSBURECOMPPS4 "$PS4_BUILD_ROOT/out" | tail -1)"
 mkdir -p "$HERE/../out" "$PS4_BUILD_ROOT/oelf"
-NAME="SSBU-v$VERSION$([ "${SSBU_WITH_DATA:-0}" = 1 ] && echo -full).pkg"
+NAME="SSBU-v$VERSION$([ "${SSBU_WITH_DATA:-0}" = 1 ] && echo -full || true).pkg"
 cp "$PKG" "$HERE/../out/$NAME"
 cp "$BUILD/eboot_eboot/eboot.oelf" "$PS4_BUILD_ROOT/oelf/v$VERSION.oelf"
 cp "$BUILD/eboot" "$PS4_BUILD_ROOT/oelf/v$VERSION.elf"
