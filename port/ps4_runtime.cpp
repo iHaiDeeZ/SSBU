@@ -40,6 +40,12 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
                                       off_t* physOut);
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
+int32_t ps4_release_direct(off_t phys, size_t len) __asm__("sceKernelReleaseDirectMemory");
+void* ps4_pthread_self(void) __asm__("scePthreadSelf");
+int32_t ps4_attr_init(void** attr) __asm__("scePthreadAttrInit");
+int32_t ps4_attr_get(void* thread, void** attr) __asm__("scePthreadAttrGet");
+int32_t ps4_attr_getstack(void* const* attr, void** addr, size_t* size) __asm__("scePthreadAttrGetstack");
+int32_t ps4_attr_destroy(void** attr) __asm__("scePthreadAttrDestroy");
 
 // dlmalloc mspace API (port/ps4_dlmalloc.c).
 typedef void* mspace;
@@ -92,12 +98,36 @@ unsigned long long elf(const void* address) {
                                            reinterpret_cast<uintptr_t>(__text_start));
 }
 
-// Logs the code addresses on the current stack (no frame pointers in release builds).
+// The end of the calling thread's stack (0: unknown).
+uintptr_t stackEnd() {
+    static thread_local uintptr_t end = 1;
+    if (end == 1) {
+        end = 0;
+        void* attr = nullptr;
+        void* addr = nullptr;
+        size_t size = 0;
+        if (ps4_attr_init(&attr) == 0) {
+            if (ps4_attr_get(ps4_pthread_self(), &attr) == 0 && ps4_attr_getstack(&attr, &addr, &size) == 0 && addr)
+                end = reinterpret_cast<uintptr_t>(addr) + size;
+            ps4_attr_destroy(&attr);
+        }
+    }
+    return end;
+}
+
+// Logs the code addresses on the current stack (no frame pointers in release builds). Not past
+// the stack's end: SSBU v00.25's GPU thread, out of heap, crashed here reading beyond its top.
 void logStack() {
     const uintptr_t base = reinterpret_cast<uintptr_t>(__text_start);
     const auto* stack = static_cast<const uintptr_t*>(__builtin_frame_address(0));
+    const uintptr_t end = stackEnd();
+    int words = 64;   // (the stack's end unknown: a little only)
+    if (end > reinterpret_cast<uintptr_t>(stack))
+        words = static_cast<int>((end - reinterpret_cast<uintptr_t>(stack)) / sizeof(uintptr_t));
+    if (words > 512)
+        words = 512;
     int found = 0;
-    for (int i = 0; i < 512 && found < 16; i++) {
+    for (int i = 0; i < words && found < 16; i++) {
         if (stack[i] >= base && stack[i] < base + 0x1000000) {
             heapLog("[ssbu] heap:   stack elf 0x%llx\n", static_cast<unsigned long long>(stack[i] - base));
             found++;
@@ -227,47 +257,108 @@ inline mspace getHeap() {
 // (148 MiB in Mario Kart: Double Dash!!), the allocation failed and the app crashed. Direct
 // memory is a separate 4.5 GiB pool (the GPU's); with FOOTERS, free and realloc find this heap
 // from the chunk itself.
-mspace g_overflow = nullptr;
-uintptr_t g_overflowBase = 0;
-size_t g_overflowSize = 0;
-bool g_overflowTried = false;
+// SSBU: more than one, made as each fills - v00.25's long sessions ran a single 512 MiB one out
+// (the GPU thread's malloc, the shader compiler's, a C++ new that threw), while direct memory was
+// still free.
+constexpr int MAX_OVERFLOWS = 8;
+mspace g_overflows[MAX_OVERFLOWS];
+uintptr_t g_overflowBases[MAX_OVERFLOWS];
+size_t g_overflowSizes[MAX_OVERFLOWS];
+int g_overflowCount = 0;   // (written under g_overflowLock, read without it: acquire)
+std::atomic_flag g_overflowLock = ATOMIC_FLAG_INIT;
+unsigned long long g_overflowRefusedAt = 0;   // (the last time no direct memory was there: ms)
 
-mspace overflowHeap() {
-    if (mspace msp = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE))
-        return msp;
-    if (__atomic_exchange_n(&g_overflowTried, true, __ATOMIC_ACQ_REL))
-        return __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);  // another thread is (or was) at it
-    const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
-    for (size_t size : sizes) {
-        off_t phys = 0;
-        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
-            continue;
-        // A hint well above 0x200000000, where the kernel library puts its own objects.
-        void* base = reinterpret_cast<void*>(0x1800000000ull);
-        const int32_t ret = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
-        if (ret != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
-            heapLog("[ssbu] heap: overflow heap: mapping %zu MiB of direct memory failed (0x%x, %p)\n",
-                    size / MB, ret, base);
-            continue;
+unsigned long long nowMs() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<unsigned long long>(ts.tv_sec) * 1000 + static_cast<unsigned long long>(ts.tv_nsec) / 1000000;
+}
+
+// A new overflow heap, unless another thread made one since the caller saw `seen` of them (then
+// that one). Direct memory refused: not asked again for a second.
+mspace addOverflow(int seen) {
+    while (g_overflowLock.test_and_set(std::memory_order_acquire))
+        sched_yield();
+    const int n = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    mspace made = nullptr;
+    if (n != seen) {
+        made = g_overflows[n - 1];
+    } else if (n < MAX_OVERFLOWS && (!g_overflowRefusedAt || nowMs() - g_overflowRefusedAt > 1000)) {
+        const size_t first[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB, 64 * MB};
+        const size_t more[] = {256 * MB, 128 * MB, 64 * MB};
+        const size_t* sizes = n ? more : first;
+        const int nsizes = n ? 3 : 5;
+        for (int k = 0; k < nsizes && !made; k++) {
+            const size_t size = sizes[k];
+            off_t phys = 0;
+            if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
+                continue;
+            // A hint well above 0x200000000, where the kernel library puts its own objects.
+            void* base = reinterpret_cast<void*>(0x1800000000ull + static_cast<uint64_t>(n) * 0x40000000ull);
+            const int32_t ret = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
+            if (ret != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
+                heapLog("[ssbu] heap: overflow heap: mapping %zu MiB of direct memory failed (0x%x, %p)\n", size / MB,
+                        ret, base);
+                ps4_release_direct(phys, size);
+                continue;
+            }
+            mspace msp = create_mspace_with_base(base, size, 1);
+            if (!msp)
+                continue;
+            g_overflows[n] = msp;
+            g_overflowBases[n] = reinterpret_cast<uintptr_t>(base);
+            g_overflowSizes[n] = size;
+            __atomic_store_n(&g_overflowCount, n + 1, __ATOMIC_RELEASE);
+            heapLog("[ssbu] heap: %s full: overflow heap %d, %zu MiB of direct memory at %p\n",
+                    n ? "overflow heaps" : "main heap", n + 1, size / MB, base);
+            made = msp;
         }
-        mspace msp = create_mspace_with_base(base, size, 1);
-        if (!msp)
-            continue;
-        g_overflowBase = reinterpret_cast<uintptr_t>(base);
-        g_overflowSize = size;
-        __atomic_store_n(&g_overflow, msp, __ATOMIC_RELEASE);
-        heapLog("[ssbu] heap: main heap full: overflow heap of %zu MiB of direct memory at %p\n", size / MB,
-                base);
-        return msp;
+        if (!made) {
+            g_overflowRefusedAt = nowMs();
+            heapLog("[ssbu] heap: heap full and no direct memory for another overflow heap (%d made)\n", n);
+        }
     }
-    heapLog("[ssbu] heap: main heap full and no direct memory for an overflow heap\n");
+    g_overflowLock.clear(std::memory_order_release);
+    return made;
+}
+
+// An allocation from the overflow heaps: the newest first, then the older ones, then a new one.
+template <class Alloc>
+void* fromOverflow(Alloc alloc) {
+    const int n = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    for (int i = n - 1; i >= 0; i--)
+        if (void* p = alloc(g_overflows[i]))
+            return p;
+    if (mspace msp = addOverflow(n))
+        return alloc(msp);
     return nullptr;
 }
 
 bool ownsPointer(const void* p) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(p);
-    return (address >= g_heapBase && address < g_heapBase + g_heapSize) ||
-           (address >= g_overflowBase && address < g_overflowBase + g_overflowSize);
+    if (address >= g_heapBase && address < g_heapBase + g_heapSize)
+        return true;
+    const int n = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (address >= g_overflowBases[i] && address < g_overflowBases[i] + g_overflowSizes[i])
+            return true;
+    return false;
+}
+
+// Bytes handed out (usable sizes), for the log: what fills the heap over a session.
+std::atomic<size_t> g_inUse{0};
+std::atomic<size_t> g_peakInUse{0};
+void noteTaken(void* p) {
+    if (!p)
+        return;
+    const size_t now = g_inUse.fetch_add(mspace_usable_size(p), std::memory_order_relaxed) + mspace_usable_size(p);
+    size_t peak = g_peakInUse.load(std::memory_order_relaxed);
+    while (now > peak && !g_peakInUse.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+    }
+}
+void noteGiven(void* p) {
+    if (p)
+        g_inUse.fetch_sub(mspace_usable_size(p), std::memory_order_relaxed);
 }
 
 // The operation in progress, for error reports (thread-local: allocations happen on any thread).
@@ -385,10 +476,10 @@ void* __wrap_malloc(size_t size) {
     if (!p)
         p = mspace_malloc(getHeap(), size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_malloc(overflow, size);
+        p = fromOverflow([&](mspace m) { return mspace_malloc(m, size); });
     if (!p)
         reportFailure("malloc", size);
+    noteTaken(p);
     return p;
 }
 
@@ -406,6 +497,7 @@ void __wrap_free(void* ptr) {
         }
         return;
     }
+    noteGiven(ptr);
     mspace_free(getHeap(), ptr);
 }
 
@@ -417,10 +509,10 @@ void* __wrap_calloc(size_t nelem, size_t size) {
     if (!p)
         p = mspace_calloc(getHeap(), nelem, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_calloc(overflow, nelem, size);
+        p = fromOverflow([&](mspace m) { return mspace_calloc(m, nelem, size); });
     if (!p)
         reportFailure("calloc", nelem * size);
+    noteTaken(p);
     return p;
 }
 
@@ -435,22 +527,30 @@ void* __wrap_realloc(void* ptr, size_t size) {
         return nullptr;
     }
     if (ptr && size == 0) {
+        noteGiven(ptr);
         mspace_free(getHeap(), ptr);
         return nullptr;
     }
     // With FOOTERS this grows the chunk inside the arena it came from (the mspace argument is
     // only used for new allocations); when that arena is full, move it to this thread's.
+    const size_t before = ptr ? mspace_usable_size(ptr) : 0;
     void* p = ptr ? mspace_realloc(getHeap(), ptr, size) : nullptr;
-    if (!p) {
+    if (p) {
+        const size_t after = mspace_usable_size(p);
+        if (after >= before)
+            g_inUse.fetch_add(after - before, std::memory_order_relaxed);
+        else
+            g_inUse.fetch_sub(before - after, std::memory_order_relaxed);
+    } else {
         p = t_arena ? mspace_malloc(t_arena, size) : nullptr;
         if (!p)
             p = mspace_malloc(getHeap(), size);
         if (!p)
-            if (mspace overflow = overflowHeap())
-                p = mspace_malloc(overflow, size);
+            p = fromOverflow([&](mspace m) { return mspace_malloc(m, size); });
+        noteTaken(p);
         if (p && ptr) {
-            const size_t old_size = mspace_usable_size(ptr);
-            memcpy(p, ptr, old_size < size ? old_size : size);
+            memcpy(p, ptr, before < size ? before : size);
+            noteGiven(ptr);
             mspace_free(getHeap(), ptr);
         }
     }
@@ -467,10 +567,10 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     if (!p)
         p = mspace_memalign(getHeap(), alignment, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_memalign(overflow, alignment, size);
+        p = fromOverflow([&](mspace m) { return mspace_memalign(m, alignment, size); });
     if (!p)
         reportFailure("memalign", size);
+    noteTaken(p);
     return p;
 }
 
@@ -516,6 +616,17 @@ void ps4_heap_private_arena(const char* name) {
         pthread_setspecific(g_arenaKey, t_arena);
     heapLog("[ssbu] heap: private %zu MiB arena for '%s'%s\n", ARENA_SIZE / MB, name,
             t_arena ? "" : " FAILED");
+}
+
+// For the game's log every few seconds: what the host heap holds, and where it lives.
+void ps4_heap_summary(char* out, size_t n) {
+    const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    size_t overflow = 0;
+    for (int i = 0; i < count; i++)
+        overflow += g_overflowSizes[i];
+    snprintf(out, n, "host heap %zu MiB in use (peak %zu) of %zu MiB: main %zu + %d overflow heap%s %zu; failed allocations %d",
+             g_inUse.load(std::memory_order_relaxed) / MB, g_peakInUse.load(std::memory_order_relaxed) / MB,
+             (g_heapSize + overflow) / MB, g_heapSize / MB, count, count == 1 ? "" : "s", overflow / MB, g_errors);
 }
 
 // posix_memalign and aligned_alloc in libc.a are built on __memalign.

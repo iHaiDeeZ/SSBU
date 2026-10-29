@@ -78,7 +78,7 @@ index 4a4d0e2..72f666e 100644
 +void display_set_upscaler(int upscaler);      /* UPSCALE_*: from the next present */
 +void display_set_fsr_sharpness(float stops);
 diff --git a/runtime/gpu_d3d11.c b/runtime/gpu_d3d11.c
-index f685d58..6b24876 100644
+index f685d58..cae5d1f 100644
 --- a/runtime/gpu_d3d11.c
 +++ b/runtime/gpu_d3d11.c
 @@ -48,6 +48,14 @@ static u32 final_w, final_h;
@@ -563,7 +563,7 @@ index f685d58..6b24876 100644
      prewarm_t0 = GetTickCount64();
      prewarm_bytes0 = private_bytes();
      Prewarm *table = calloc(PREWARM_SLOTS, sizeof *table);
-@@ -1298,7 +1614,7 @@ static void enqueue_shader(Shader *s) {
+@@ -1298,9 +1614,13 @@ static void enqueue_shader(Shader *s) {
          job_queue[q].tail = s;
      }
      ReleaseSRWLockExclusive(&jobs_lock);
@@ -571,8 +571,53 @@ index f685d58..6b24876 100644
 +    WakeAllConditionVariable(&jobs_cv);   /* (all: the one woken may be the first, which leaves compiles) */
  }
  
++#ifdef __ORBIS__
++__attribute__((weak)) void ps4_heap_summary(char *out, size_t n);   /* (the port's heap: port/ps4_runtime.cpp) */
++#endif
++
  /* For a crash or freeze report: what each compiler thread is doing (to line, a line at a time),
-@@ -1474,13 +1790,25 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
+  * its program kept next to the disk cache (shadercrash/) so it can be compiled again outside the
+  * game. */
+@@ -1315,24 +1635,32 @@ void gfx_report_compiles(void (*line)(const char *text)) {
+         LONG step = compilers[i].step;
+         if (!s || step == STEP_IDLE) continue;
+         if (!busy++) line("shader compiler threads at the time:\n");
++        u64 since = compilers[i].since_ms;
++        u64 took = now > since ? now - since : 0;   /* (set by the compiler after `now` was read) */
++        /* Its program saved only when this thread crashed in it, or it has been at it for a while:
++         * a compile that just started frees its HLSL when fxc is done - v00.25's freeze reports
++         * read it as it went (fputs of NULL) and the report itself crashed the game. */
++        int keep = compilers[i].thread == self || took >= 2000;
+         char dir[1100], path[1200];
+         snprintf(dir, sizeof dir, "%s/../shadercrash", rt_data_dir);
+-        CreateDirectoryA(dir, NULL);
+         const char *saved = "";
+-        if (s->hlsl) {
++        const char *hlsl = keep ? s->hlsl : NULL;   /* (read once) */
++        if (hlsl) {
++            CreateDirectoryA(dir, NULL);
+             snprintf(path, sizeof path, "%s/%s_%08x_%016llx.hlsl", dir, s->name, s->vs_outputs, s->table_hash);
+             FILE *f = fopen(path, "w");
+-            if (f) { fputs(s->hlsl, f); fclose(f); saved = "; HLSL saved"; }
++            if (f) { fputs(hlsl, f); fclose(f); saved = "; HLSL saved"; }
+         }
+-        const void *dxbc = compilers[i].dxbc;
++        const void *dxbc = keep ? compilers[i].dxbc : NULL;
+         size_t size = compilers[i].dxbc_size;
+         if (step == STEP_DRIVER && dxbc && size) {
++            CreateDirectoryA(dir, NULL);
+             snprintf(path, sizeof path, "%s/%s_%08x_%016llx.dxbc", dir, s->name, s->vs_outputs, s->table_hash);
+             FILE *f = fopen(path, "wb");
+-            if (f) { fwrite(dxbc, 1, size, f); fclose(f); saved = s->hlsl ? "; HLSL and DXBC saved" : "; DXBC saved"; }
++            if (f) { fwrite(dxbc, 1, size, f); fclose(f); saved = hlsl ? "; HLSL and DXBC saved" : "; DXBC saved"; }
+         }
+         snprintf(text, sizeof text, "  thread %lu%s: %s - %s, for %.1f s%s\n", (unsigned long)compilers[i].thread, compilers[i].thread == self ? " (this thread)" : "",
+-                 s->name, what[step], (now - compilers[i].since_ms) / 1000.0, saved);
++                 s->name, step >= 0 && step < 4 ? what[step] : "?", took / 1000.0, saved);
+         line(text);
+     }
+     if (busy) { snprintf(text, sizeof text, "  (programs in %s/../shadercrash)\n", rt_data_dir); line(text); }
+@@ -1474,13 +1802,25 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
          return s;
      }
      char path[1200];
@@ -603,7 +648,7 @@ index f685d58..6b24876 100644
      return s;
  }
  
-@@ -1731,6 +2059,99 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
+@@ -1731,6 +2071,99 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
      return u->srv;
  }
  
@@ -703,7 +748,7 @@ index f685d58..6b24876 100644
  static ID3D11Buffer *params_buffer, *index_buffer;
  static u32 index_cap, index_pos, index_first;   /* the index ring: its size, where the next indices go, where this draw's start (in indices) */
  static DrawParams params_written;   /* what params_buffer holds (a draw with the same parameters writes nothing) */
-@@ -3457,7 +3878,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
+@@ -3457,7 +3890,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
          }
          stream_skip[j] = 0;
          Resident *part = resident_overlapping_gpu(start, (u32)size);
@@ -723,7 +768,7 @@ index f685d58..6b24876 100644
          if (size > stream_cap) { stream_data = realloc(stream_data, size + 16); stream_cap = (u32)size; }
          read_gpu(start, (u32)size, stream_data);
          vsrv[n] = stream_srv[j] = part ? upload_composed(SHADER_VERTEX, 18 + n, start, stream_data, (u32)size) : NULL;
-@@ -4346,6 +4778,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4346,6 +4790,30 @@ void gfx_present(u64 guest, u32 width, u32 height) {
          ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
          ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -754,7 +799,7 @@ index f685d58..6b24876 100644
      } else {   /* as big as its place or smaller: drawn bilinear */
          ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
          ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-@@ -4453,12 +4909,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+@@ -4453,12 +4921,17 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                   profile_running() ? "  (profiling...)" : "");
          char net[512];
          net_status(net, sizeof net);
@@ -773,6 +818,21 @@ index f685d58..6b24876 100644
          }
          char pads[256];
          pad_describe(pads, sizeof pads);
+@@ -4478,6 +4951,14 @@ void gfx_present(u64 guest, u32 width, u32 height) {
+                     nk, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_reloaded, gfx_stat_kept_mismatches);
+             fprintf(stderr, "[stats] memory taken away: %llu unmaps heard, %llu resident regions, kept buffers and compute inputs dropped\n",
+                     gfx_stat_unmapped, gfx_stat_unmap_dropped);
++#ifdef __ORBIS__
++            {   /* (what fills over a long session: v00.25 ran out of host heap after 8-40 minutes) */
++                char heap[256] = "host heap: not known";
++                if (ps4_heap_summary) ps4_heap_summary(heap, sizeof heap);
++                fprintf(stderr, "[stats] memory: %s; guest memory mapped %llu MiB, %llu maps failed\n", heap,
++                        rt_ps4_mapped_bytes() >> 20, rt_ps4_failed_maps());
++            }
++#endif
+             static u64 last_compared, compared_frames0;
+             fprintf(stderr, "[stats] state objects: %u rasterizer, %u depth/stencil, %u blend, %u samplers; reuse checks compared %.2f MB/frame\n",
+                     raster_state_count, depth_state_count, blend_state_count, nsamplers,
 diff --git a/runtime/gpu_display.c b/runtime/gpu_display.c
 index 2cafd68..6150b41 100644
 --- a/runtime/gpu_display.c
@@ -1171,7 +1231,7 @@ index 4df35f9..6487c68 100644
  void settings_restart(void) {
      if (online_files)
 diff --git a/runtime/host.c b/runtime/host.c
-index ac98629..67b7084 100644
+index ac98629..8fa529a 100644
 --- a/runtime/host.c
 +++ b/runtime/host.c
 @@ -411,8 +411,18 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
@@ -1193,7 +1253,7 @@ index ac98629..67b7084 100644
      Dl_info di;
      if (dladdr(pc, &di) && di.dli_fname) {
          const char *base = strrchr(di.dli_fname, '/');
-@@ -459,45 +469,209 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
+@@ -459,45 +469,225 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
  }
  #else
  /* Another thread's frames: it is interrupted and records its own stack. */
@@ -1250,9 +1310,25 @@ index ac98629..67b7084 100644
 +/* (a line at a time: the PS4's freeze reports, kernel.c's kernel_thread_stacks; with
 + * rt_bt_host_lines also the host's frames, as eboot ELF addresses) */
 +int rt_bt_host_lines;
++#ifdef __ORBIS__
++static __thread int bt_by_pthread;   /* (rt_backtrace_pthread_lines: the target is bt_pthread) */
++static __thread pthread_t bt_pthread;
++void rt_backtrace_pthread_lines(pthread_t thread, int max_frames, void (*line)(const char *text)) {
++    bt_by_pthread = 1;
++    bt_pthread = thread;
++    rt_backtrace_thread_lines(NULL, max_frames, line);
++    bt_by_pthread = 0;
++}
++#endif
++
 +void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text)) {
      static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++#ifdef __ORBIS__
++    pid_t tid = bt_by_pthread ? 1 : rt_thread_tid(thread);
++    pthread_t target = bt_by_pthread ? bt_pthread : (tid ? rt_thread_pthread(thread) : 0);
++#else
      pid_t tid = rt_thread_tid(thread);
++#endif
      if (!tid) return;
      pthread_mutex_lock(&lock);
      while (sem_trywait(&bt_done) == 0) {}   /* (an answer that came after its wait gave up) */
@@ -1265,7 +1341,7 @@ index ac98629..67b7084 100644
      until.tv_nsec += 250000000L;
      if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
 +#ifdef __ORBIS__
-+    if (pthread_kill(rt_thread_pthread(thread), SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
++    if (pthread_kill(target, SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
 +#else
      if (syscall(SYS_tgkill, getpid(), tid, SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
 +#endif
@@ -1408,7 +1484,7 @@ index ac98629..67b7084 100644
  /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
   * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
   * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
-@@ -513,6 +687,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -513,6 +703,14 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      static volatile RtTid reporter;
      RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
      (void)si;
@@ -1423,7 +1499,7 @@ index ac98629..67b7084 100644
  #else
      int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
      if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
-@@ -530,6 +712,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -530,6 +728,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
  #ifdef __APPLE__
      u64 sp = uc->uc_mcontext->__ss.__sp;
      int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
@@ -1433,7 +1509,7 @@ index ac98629..67b7084 100644
  #else
      u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
      int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
-@@ -551,6 +736,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -551,6 +752,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      void *frames[64];
  #ifdef __APPLE__   /* (from the faulting context: a leaf function's caller is in the link register) */
      int n = walk_frames(pc, uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ss.__fp, frames, 64), from = 0;
@@ -1442,7 +1518,7 @@ index ac98629..67b7084 100644
  #else
      int n = backtrace(frames, 64), from = 0;
      for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
-@@ -558,6 +745,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
+@@ -558,6 +761,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
      for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
      gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
      print_frames(frames + from, n - from);
@@ -1452,7 +1528,7 @@ index ac98629..67b7084 100644
      report_close(report);
      fflush(stderr);
      _exit(5);
-@@ -603,6 +793,9 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
+@@ -603,6 +809,9 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
      report_open("stopped", report, sizeof report);
      out("\n*** stopped during %s: %s\n", phase, text);
      rt_backtrace();
@@ -1462,7 +1538,7 @@ index ac98629..67b7084 100644
      report_close(report);
      fflush(stderr);
      ExitProcess(3);
-@@ -906,6 +1099,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
+@@ -906,6 +1115,14 @@ u64 rt_load_nro(Cpu *c, u64 image) {
      const RtModule *mod = NULL;
      for (u32 k = 0; k < rt_nro_count && !mod; k++)
          if (!strcmp(rt_nro_modules[k]->build_id, id)) mod = rt_nro_modules[k];
@@ -1477,7 +1553,7 @@ index ac98629..67b7084 100644
      if (!mod || module_count == MAX_MODULES) { ReleaseSRWLockExclusive(&lock); return 0; }
      u32 m = module_count;
      modules[m] = mod;
-@@ -1075,6 +1276,10 @@ int main(int argc, char **argv) {
+@@ -1075,6 +1292,10 @@ int main(int argc, char **argv) {
  #endif
  #ifdef __APPLE__
      mac_start(argc, argv, &dir, &options);
@@ -1489,14 +1565,17 @@ index ac98629..67b7084 100644
      if (!dir) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
      display_dpi_aware();
 diff --git a/runtime/host.h b/runtime/host.h
-index 5cdc854..c864548 100644
+index 5cdc854..ecef1ef 100644
 --- a/runtime/host.h
 +++ b/runtime/host.h
-@@ -51,7 +51,10 @@ u64 rt_symbol(const char *name);                       /* guest address of an ex
+@@ -51,7 +51,13 @@ u64 rt_symbol(const char *name);                       /* guest address of an ex
  const char *rt_describe(u64 guest_addr, char *buf, size_t n);   /* "module+0x1234" */
  void rt_backtrace(void);
  void rt_backtrace_thread(HANDLE thread, int max_frames);   /* another thread's guest frames */
 +void rt_backtrace_thread_lines(HANDLE thread, int max_frames, void (*line)(const char *text));   /* (Linux, the PS4) */
++#ifdef __ORBIS__
++void rt_backtrace_pthread_lines(pthread_t thread, int max_frames, void (*line)(const char *text));   /* (a thread known by its pthread) */
++#endif
  void kernel_dump_threads(void);
 +void kernel_thread_stacks(void (*line)(const char *text));   /* (the PS4: every guest thread's, for a freeze report) */
 +void kernel_memory_calls(void (*line)(const char *text));    /* (the PS4: the last heap, mapping and physical memory calls) */
@@ -1571,10 +1650,30 @@ index e1a7bdf..a3a5fff 100644
      SDL_AudioSpec want, got;
      memset(&want, 0, sizeof want);
 diff --git a/runtime/kernel.c b/runtime/kernel.c
-index 029ed2f..0351d25 100644
+index 029ed2f..6c42ed9 100644
 --- a/runtime/kernel.c
 +++ b/runtime/kernel.c
-@@ -207,6 +207,42 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32
+@@ -56,6 +56,19 @@ typedef struct KObject { int type, signaled; KThread *thread; void *session; } K
+ typedef struct Region { u64 base, size; u32 state, perm; } Region;
+ 
+ static CRITICAL_SECTION klock;
++#ifdef __ORBIS__
++/* Who took the kernel's lock last, for a freeze report: the holder of a lock a frozen game waits
++ * on may be no guest thread (v00.25's freeze: thread 101217), whose stack is then shown too. */
++static pthread_t klock_pt;
++static volatile DWORD klock_pt_tid;
++static void klock_enter(void) {
++    EnterCriticalSection(&klock);
++    klock_pt = pthread_self();
++    klock_pt_tid = GetCurrentThreadId();
++}
++#else
++#define klock_enter() EnterCriticalSection(&klock)
++#endif
+ /* Every thread the kernel made (an exited one stays: its handle may still be waited on). Waits
+  * and hand-overs look through these rather than through every handle. */
+ static KThread *threads[1024];
+@@ -207,9 +220,45 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32
   * which on macOS leaves the signal mask alone - nothing changes it on a guest thread.) */
  static __thread jmp_buf *exit_point;
  #endif
@@ -1616,8 +1715,12 @@ index 029ed2f..0351d25 100644
 +#endif
  
  static _Noreturn void exit_thread(KThread *t) {
-     EnterCriticalSection(&klock);
-@@ -235,6 +271,9 @@ static DWORD WINAPI thread_main(LPVOID param) {
+-    EnterCriticalSection(&klock);
++    klock_enter();
+     t->exited = 1;
+     objects[t->handle - 0xA000].signaled = 1;
+     kwake_handle(t->handle);
+@@ -235,6 +284,9 @@ static DWORD WINAPI thread_main(LPVOID param) {
      jmp_buf out;
      exit_point = &out;
      if (RT_SETJMP(out)) return 0;
@@ -1627,7 +1730,15 @@ index 029ed2f..0351d25 100644
  #endif
      rt_call(t->cpu, t->entry);
      exit_thread(t);
-@@ -250,6 +289,9 @@ Cpu *kernel_main_thread(u32 *handle) {
+@@ -243,13 +295,16 @@ static DWORD WINAPI thread_main(LPVOID param) {
+ Cpu *kernel_main_thread(u32 *handle) {
+     u64 top = STACK_BASE + STACK_SIZE - 0x10000;
+     commit(top - MAIN_STACK, MAIN_STACK, "the main stack");
+-    EnterCriticalSection(&klock);
++    klock_enter();
+     kernel_add_region(top - MAIN_STACK, MAIN_STACK, GM_STACK, 3);
+     KThread *t = new_thread(0, 0, top, 44, 0);
+     t->started = 1;
      DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host, 0, FALSE, DUPLICATE_SAME_ACCESS);
      LeaveCriticalSection(&klock);
      *handle = t->handle;
@@ -1637,7 +1748,12 @@ index 029ed2f..0351d25 100644
      return t->cpu;
  }
  
-@@ -462,6 +504,7 @@ void rt_svc(Cpu *c, u32 n) {
+@@ -458,10 +513,11 @@ void rt_svc(Cpu *c, u32 n) {
+     }
+     }
+ 
+-    EnterCriticalSection(&klock);
++    klock_enter();
      switch (n) {
      case 0x01: {   /* SetHeapSize(size) -> address */
          u64 size = x[1];
@@ -1645,7 +1761,7 @@ index 029ed2f..0351d25 100644
          if (size > HEAP_LIMIT) { x[0] = R_OUT_OF_MEMORY; break; }
          if (size > heap_size) commit(HEAP_BASE + heap_size, size - heap_size, "the heap");
          if (heap_size) remove_region(HEAP_BASE);
-@@ -473,6 +516,7 @@ void rt_svc(Cpu *c, u32 n) {
+@@ -473,6 +529,7 @@ void rt_svc(Cpu *c, u32 n) {
      case 0x02: case 0x03: x[0] = R_OK; break;            /* SetMemoryPermission / SetMemoryAttribute */
      case 0x04: {   /* MapMemory(dst, src, size): the pages appear at dst; here, as a copy */
          u32 i = 0;
@@ -1653,7 +1769,7 @@ index 029ed2f..0351d25 100644
          while (i < 1024 && maps[i].size) i++;
          if (i == 1024) rt_fatal("kernel: too many memory mappings");
          commit(x[0], x[2], "a memory mapping");
-@@ -483,6 +527,7 @@ void rt_svc(Cpu *c, u32 n) {
+@@ -483,6 +540,7 @@ void rt_svc(Cpu *c, u32 n) {
          break;
      }
      case 0x05: {   /* UnmapMemory(dst, src, size) */
@@ -1661,7 +1777,7 @@ index 029ed2f..0351d25 100644
          for (u32 i = 0; i < 1024; i++)
              if (maps[i].size && maps[i].dst == x[0]) {
                  memcpy(G2H(maps[i].src), G2H(maps[i].dst), maps[i].size);
-@@ -582,11 +627,13 @@ void rt_svc(Cpu *c, u32 n) {
+@@ -582,11 +640,13 @@ void rt_svc(Cpu *c, u32 n) {
          break;
      }
      case 0x2C:     /* MapPhysicalMemory(address, size): back part of the alias area with memory */
@@ -1675,7 +1791,16 @@ index 029ed2f..0351d25 100644
          gpu_memory_unmapping(x[0], x[1]);   /* (queued GPU work and the renderer may read it) */
          VirtualFree(G2H(x[0]), x[1], MEM_DECOMMIT);
          unmap_range(x[0], x[1]);
-@@ -648,6 +695,28 @@ void kernel_dump_threads(void) {
+@@ -636,7 +696,7 @@ void kernel_thread_states(void (*line)(const char *text)) {
+ }
+ 
+ void kernel_dump_threads(void) {
+-    EnterCriticalSection(&klock);
++    klock_enter();
+     for (u32 i = 1; i < 4096; i++) {
+         KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
+         if (!t || !t->started || t->exited || !t->host) continue;
+@@ -648,8 +708,36 @@ void kernel_dump_threads(void) {
      LeaveCriticalSection(&klock);
  }
  
@@ -1687,8 +1812,14 @@ index 029ed2f..0351d25 100644
 +    if (!nthreads) return;   /* (a stop before the kernel started: its lock not made yet) */
 +    int locked = TryEnterCriticalSection(&klock);
 +    if (!locked) {
-+        snprintf(text, sizeof text, "  (the kernel's lock is held by thread %lu: read without it)\n", (unsigned long)kernel_lock_owner());
++        DWORD owner = kernel_lock_owner();
++        snprintf(text, sizeof text, "  (the kernel's lock is held by thread %lu: read without it)\n", (unsigned long)owner);
 +        line(text);
++        if (owner && owner == klock_pt_tid) {
++            snprintf(text, sizeof text, "  the kernel's lock holder (host thread %lu):\n", (unsigned long)owner);
++            line(text);
++            rt_backtrace_pthread_lines(klock_pt, 24, line);
++        }
 +    }
 +    for (u32 i = 1; i < 4096; i++) {
 +        KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
@@ -1702,8 +1833,50 @@ index 029ed2f..0351d25 100644
 +#endif
 +
  u32 kernel_new_session(void *session) {
-     EnterCriticalSection(&klock);
+-    EnterCriticalSection(&klock);
++    klock_enter();
      u32 h = new_handle(OBJ_SESSION, NULL);
+     objects[h - 0xA000].session = session;
+     LeaveCriticalSection(&klock);
+@@ -662,14 +750,14 @@ void *kernel_session_of(u32 handle) {
+ }
+ 
+ u32 kernel_create_event(void) {
+-    EnterCriticalSection(&klock);
++    klock_enter();
+     u32 h = new_handle(OBJ_EVENT, NULL);
+     LeaveCriticalSection(&klock);
+     return h;
+ }
+ 
+ void kernel_signal_event(u32 handle) {
+-    EnterCriticalSection(&klock);
++    klock_enter();
+     u32 k = handle - 0xA000;
+     if (k < 4096 && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; kwake_handle(handle); }
+     LeaveCriticalSection(&klock);
+diff --git a/runtime/linux/eh.cpp b/runtime/linux/eh.cpp
+index 0a27ca5..bfb1e44 100644
+--- a/runtime/linux/eh.cpp
++++ b/runtime/linux/eh.cpp
+@@ -18,6 +18,7 @@ terminate_handler set_terminate(terminate_handler) noexcept;
+ extern "C" {
+ __attribute__((noreturn)) void rt_fatal(const char *fmt, ...);
+ const char *rt_describe(u64 guest_addr, char *buf, size_t n);
++__attribute__((weak)) int ps4_describe_exception(char *out, size_t n);   /* (the PS4 port's crash log: its type and what()) */
+ }
+ 
+ static thread_local u64 pending_lp, pending_sp;
+@@ -27,6 +28,9 @@ static void nobody_resumed() {
+     if (pending_lp)
+         rt_fatal("C++ exception: no recompiled frame resumes landing pad %s (sp %#llx)", rt_describe(pending_lp, name, sizeof name),
+                  (unsigned long long)pending_sp);
++    char what[400];
++    if (ps4_describe_exception && ps4_describe_exception(what, sizeof what))
++        rt_fatal("a host C++ exception was not caught: %s", what);
+     rt_fatal("a host C++ exception was not caught");
+ }
+ 
 diff --git a/runtime/linux/include/windows.h b/runtime/linux/include/windows.h
 index cbd4af5..05199a1 100644
 --- a/runtime/linux/include/windows.h

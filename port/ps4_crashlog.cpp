@@ -220,6 +220,35 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     abort();
 }
 
+}  // namespace
+
+// The exception being handled, for the runtime's own terminate handler (runtime/linux/eh.cpp),
+// which replaces terminateHandler: its type and what(). 0 when there is none.
+extern "C" int ps4_describe_exception(char* out, size_t n) {
+    const std::type_info* type = abi::__cxa_current_exception_type();
+    if (!type)
+        return 0;
+    int status = 0;
+    char* name = abi::__cxa_demangle(type->name(), nullptr, nullptr, &status);
+    const char* what = "";
+    try {
+        if (std::exception_ptr current = std::current_exception())
+            std::rethrow_exception(current);
+    } catch (const std::exception& e) {
+        what = e.what();
+    } catch (...) {
+    }
+    snprintf(out, n, "%s%s%s", name ? name : type->name(), *what ? ": " : "", what);
+    const int fd = open("/data/SSBU/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        writeFormat(fd, "\n=== uncaught exception %s\n", out);
+        close(fd);
+    }
+    return 1;
+}
+
+namespace {
+
 __attribute__((constructor(101))) void earlyInit() {
     if (traceFd() >= 0)
         writeFormat(traceFd(), "static init (text at %p)\n", static_cast<void*>(__text_start));
